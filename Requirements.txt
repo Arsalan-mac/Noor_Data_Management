@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+streamlit-option-menu
+openai
+google-generativeai
+dedupe
+pandas-dedupe
+sqlalchemy
+openpyxl
