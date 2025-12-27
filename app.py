@@ -194,25 +194,23 @@ def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data a
 
 def generate_python_rule(description, columns, provider, api_key):
     system_prompt = """
-    You are a Python Code Generator for Data Quality. 
-    Output ONLY a valid Python function named 'validate_row'. 
-    The function takes a single argument 'row' (a dictionary) and returns True (Valid) or False (Invalid).
-    
-    IMPORTANT:
-    1. Do NOT include markdown formatting (like ```python or ```). 
-    2. Output raw code only.
-    3. Handle potential missing keys gracefully.
+    You are a data quality assistant. 
+    Convert the following data quality rule in English to a Python pandas boolean mask expression.
+    Do NOT wrap it in df[...].
+    Return only the boolean expression (with proper parentheses), not a function, not an explanation.
+    Assume the dataframe is named 'df'.
     """
     
     prompt = f"""
     The DataFrame columns are: {columns}
     Rule Requirement: {description}
     
-    Generate the 'validate_row(row)' function now.
+    Generate the boolean expression now.
+    Example output format: (df['ColumnA'] > 0) & (df['ColumnB'].notna())
     """
     
     if not api_key:
-        return f"# AI Simulation for: {description}\ndef validate_row(row):\n    # Logic for columns: {columns}\n    return True"
+        return f"# AI Simulation for: {description}\n(df['{columns[0] if columns else 'Col'}'] != None)"
         
     code = query_llm(provider, api_key, prompt, system_prompt)
     
@@ -610,6 +608,8 @@ def main_app():
                     if st.button("Generate Python Logic 🤖"):
                         code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
                         st.session_state['edit_code'] = code
+                        # FORCE UPDATE TEXT AREA KEY to show immediately
+                        st.session_state['txt_code_area'] = code
                         st.rerun()
                 
                 with col2:
@@ -652,6 +652,8 @@ def main_app():
                             st.session_state['edit_name'] = r['rule_name']
                             st.session_state['edit_desc'] = r['rule_description']
                             st.session_state['edit_code'] = r['python_code']
+                            # Also update the text area key so it populates immediately
+                            st.session_state['txt_code_area'] = r['python_code']
                             st.rerun()
 
     # 7. DATA STEWARDSHIP
@@ -689,27 +691,29 @@ def main_app():
             with col2:
                 if st.button("RUN DQ ANALYSIS ⚡", type="primary", use_container_width=True):
                     df = st.session_state['steward_df'].copy()
+                    
                     for idx, rule in rules_df.iterrows():
                         rule_name = rule['rule_name']
                         code = rule['python_code']
-                        local_scope = {}
+                        
                         try:
-                            exec(code, {}, local_scope)
-                            validate_func = local_scope.get('validate_row')
-                            if validate_func:
-                                results = []
-                                justifications = []
-                                for i, row in df.iterrows():
-                                    try:
-                                        is_valid = validate_func(row.to_dict())
-                                        results.append("Valid" if is_valid else "Invalid")
-                                        justifications.append("Rule Passed" if is_valid else rule['rule_description'])
-                                    except Exception as e:
-                                        results.append("Error")
-                                        justifications.append(str(e))
-                                df[f"{rule_name}_Status"] = results
-                                df[f"{rule_name}_Justification"] = justifications
-                        except Exception as e: st.error(f"Error in rule {rule_name}: {e}")
+                            # Evaluate expression against DataFrame using eval()
+                            # Expecting a Boolean Series/Mask
+                            # Pass 'df', 'pd', 'np' in local scope just in case
+                            local_scope = {'df': df, 'pd': pd, 'np': np}
+                            
+                            # If code is "(df['A']>5)", eval returns the series directly
+                            result_mask = eval(code, {}, local_scope)
+                            
+                            if isinstance(result_mask, pd.Series):
+                                df[f"{rule_name}_Status"] = result_mask.map({True: "Valid", False: "Invalid"})
+                                df[f"{rule_name}_Justification"] = result_mask.map({True: "Rule Passed", False: rule['rule_description']})
+                            else:
+                                st.warning(f"Rule {rule_name} did not return a Series (Got {type(result_mask)})")
+
+                        except Exception as e:
+                            st.error(f"Error executing rule {rule_name}: {e}")
+                            
                     st.session_state['steward_df'] = df
                     st.success("Analysis Complete")
 
