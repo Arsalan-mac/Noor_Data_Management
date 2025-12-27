@@ -7,11 +7,32 @@ import io
 import time
 import json
 import re
-from streamlit_option_menu import option_menu
-import openai
-import google.generativeai as genai
-import dedupe
-import pandas_dedupe
+
+# --- SAFE IMPORTS (Prevents Blank Screen if libs are missing) ---
+try:
+    from streamlit_option_menu import option_menu
+    HAS_OPTION_MENU = True
+except ImportError:
+    HAS_OPTION_MENU = False
+
+try:
+    import openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+try:
+    import dedupe
+    import pandas_dedupe
+    HAS_DEDUPE = True
+except ImportError:
+    HAS_DEDUPE = False
 
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(
@@ -23,13 +44,23 @@ st.set_page_config(
 
 # Load Custom CSS
 def load_css():
-    with open("style.css", "r") as f:
-        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    # Basic styling in case file is missing
+    st.markdown("""
+        <style>
+        .stApp { background-color: #0f172a; color: #cbd5e1; }
+        .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stTextArea textarea {
+            background-color: #1e293b !important; color: #e2e8f0 !important; border: 1px solid #334155 !important;
+        }
+        div[data-testid="stSidebar"] { background-color: #020617; border-right: 1px solid #1e293b; }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Try loading external file
+    if os.path.exists("style.css"):
+        with open("style.css", "r") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
-try:
-    load_css()
-except FileNotFoundError:
-    pass # Fallback if css is missing during copy-paste
+load_css()
 
 # --- DATABASE MANAGEMENT (SQLite) ---
 DB_FILE = "noor_app.db"
@@ -58,7 +89,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS dq_rules 
                  (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, rule_name TEXT, rule_description TEXT, python_code TEXT)''')
 
-    # Mapping Config Table (New)
+    # Mapping Config Table
     c.execute('''CREATE TABLE IF NOT EXISTS mapping_config 
                  (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, config_json TEXT)''')
     
@@ -79,9 +110,12 @@ def get_db_connection():
 # --- DATA TRANSFORMATION HELPER ---
 def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     """
-    Reads the raw file and applies column mappings and value logic defined in 'Data Mapping'.
+    Reads the raw file and applies column mappings and value logic.
     Returns a DataFrame with Target Columns.
     """
+    if not os.path.exists(file_path):
+        return pd.DataFrame(), []
+
     # 1. Read Raw Data
     if file_path.endswith('.csv'): 
         df = pd.read_csv(file_path)
@@ -95,7 +129,7 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     conn.close()
 
     if not res:
-        return df, [] # Return raw df if no mapping
+        return df, [] 
 
     config = json.loads(res[0])
     target_fields = config.get('target_fields', [])
@@ -103,7 +137,6 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     value_maps = config.get('value_maps', {})
 
     # 3. Apply Column Mapping (Source -> Target)
-    # Invert mapping: {Target: Source} -> {Source: Target} for renaming
     rename_dict = {}
     valid_targets = []
     
@@ -114,14 +147,11 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     
     df = df.rename(columns=rename_dict)
     
-    # 4. Filter to keep only mapped target columns (optional, strictly speaking we usually keep only target)
-    # For user friendliness, we try to keep only valid targets, but if empty, keep all
+    # 4. Filter to keep only mapped target columns (optional)
     if valid_targets:
-        # Keep columns that match target fields (mapped ones)
-        # Note: If a source column wasn't mapped, it won't be in rename_dict keys, so it stays as source name.
-        # We generally want to filter to ONLY the Target Template structure.
         available_cols = df.columns.tolist()
         final_cols = [c for c in valid_targets if c in available_cols]
+        # Merge with unmapped target fields if needed, but standard is filtering
         df = df[final_cols]
 
     # 5. Apply Value Logic
@@ -130,7 +160,6 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
             for rule in rules:
                 old_val = rule['old']
                 new_val = rule['new']
-                # Strict string replacement for demo
                 df[target_col] = df[target_col].replace(old_val, new_val)
 
     return df, target_fields
@@ -142,6 +171,7 @@ def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data a
     
     try:
         if provider == "OpenAI (ChatGPT)":
+            if not HAS_OPENAI: return "Error: OpenAI library not installed."
             openai.api_key = api_key
             response = openai.chat.completions.create(
                 model="gpt-4o",
@@ -153,6 +183,7 @@ def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data a
             return response.choices[0].message.content
         
         elif provider == "Gemini":
+            if not HAS_GEMINI: return "Error: Google GenAI library not installed."
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel('gemini-1.5-flash')
             response = model.generate_content(system_prompt + "\n" + prompt)
@@ -185,7 +216,7 @@ def generate_python_rule(description, columns, provider, api_key):
         
     code = query_llm(provider, api_key, prompt, system_prompt)
     
-    # Post-processing to clean Markdown if LLM ignores instructions
+    # Post-processing to clean Markdown
     code = re.sub(r'```python', '', code)
     code = re.sub(r'```', '', code)
     return code.strip()
@@ -231,8 +262,6 @@ def login_page():
 
 # --- MAIN APP LOGIC ---
 def main_app():
-    init_db()
-    
     # --- SIDEBAR ---
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state['user']['name']}")
@@ -243,20 +272,26 @@ def main_app():
         else:
             st.warning("⚠️ No Project Selected")
 
-        # Updated Navigation Menu
-        selected_view = option_menu(
-            "Navigation", 
-            ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "BP Deduplication", "DQ Rules Config", "Data Stewardship", "Data Exploration"], 
-            icons=['speedometer2', 'gear', 'cloud-upload', 'git', 'people', 'tools', 'shield-check', 'compass'], 
-            menu_icon="cast", 
-            default_index=0,
-            styles={
-                "container": {"padding": "0!important", "background-color": "#0f172a"},
-                "icon": {"color": "#2563eb", "font-size": "18px"}, 
-                "nav-link": {"font-size": "14px", "text-align": "left", "margin":"0px", "--hover-color": "#1e293b"},
-                "nav-link-selected": {"background-color": "#1e293b", "border-left": "4px solid #2563eb"},
-            }
-        )
+        # Navigation
+        menu_items = ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "BP Deduplication", "DQ Rules Config", "Data Stewardship", "Data Exploration"]
+        icons = ['speedometer2', 'gear', 'cloud-upload', 'git', 'people', 'tools', 'shield-check', 'compass']
+        
+        if HAS_OPTION_MENU:
+            selected_view = option_menu(
+                "Navigation", 
+                menu_items, 
+                icons=icons, 
+                menu_icon="cast", 
+                default_index=0,
+                styles={
+                    "container": {"padding": "0!important", "background-color": "#0f172a"},
+                    "icon": {"color": "#2563eb", "font-size": "18px"}, 
+                    "nav-link": {"font-size": "14px", "text-align": "left", "margin":"0px", "--hover-color": "#1e293b"},
+                    "nav-link-selected": {"background-color": "#1e293b", "border-left": "4px solid #2563eb"},
+                }
+            )
+        else:
+            selected_view = st.radio("Navigation", menu_items)
         
         if st.button("Logout", key="logout-btn"):
             st.session_state['authenticated'] = False
@@ -397,14 +432,11 @@ def main_app():
     # 4. DATA MAPPING
     elif selected_view == "Data Mapping":
         st.title("Data Mapping Workbench")
-        
         if not st.session_state['active_project']:
             st.error("Select Active Project")
             return
             
         proj_id = st.session_state['active_project']['id']
-        
-        # Select Table to Map
         conn = get_db_connection()
         tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
@@ -418,10 +450,13 @@ def main_app():
             
             # Load Source Columns
             file_path = tables[tables['table_name'] == sel_table]['file_path'].values[0]
-            if file_path.endswith('.csv'): src_df = pd.read_csv(file_path, nrows=5)
-            else: src_df = pd.read_excel(file_path, nrows=5)
-            source_cols = ["-- Select --"] + src_df.columns.tolist()
-            
+            if os.path.exists(file_path):
+                if file_path.endswith('.csv'): src_df = pd.read_csv(file_path, nrows=5)
+                else: src_df = pd.read_excel(file_path, nrows=5)
+                source_cols = ["-- Select --"] + src_df.columns.tolist()
+            else:
+                source_cols = ["File Missing"]
+
             # Load Saved Config
             conn = get_db_connection()
             saved_config = conn.execute("SELECT config_json FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", 
@@ -440,19 +475,16 @@ def main_app():
                         config['target_fields'].append(new_field)
                         # Save
                         conn = get_db_connection()
-                        # Upsert logic (simplistic delete/insert or check exist)
                         conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
                         conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", 
                                      (proj_id, sel_domain, sel_table, json.dumps(config)))
                         conn.commit()
                         conn.close()
                         st.rerun()
-                
                 st.write("Current Target Fields:", ", ".join(config['target_fields']))
 
             # 2. Field Mapping
             st.subheader("2. Field Mapping & Value Logic")
-            
             updated_mappings = config.get('mappings', {})
             updated_value_maps = config.get('value_maps', {})
             
@@ -460,19 +492,14 @@ def main_app():
                 with st.container():
                     col1, col2, col3 = st.columns([2, 2, 2])
                     col1.markdown(f"**{t_field}**")
-                    
-                    # Dropdown for Source
                     curr_val = updated_mappings.get(t_field, "-- Select --")
-                    # Ensure current value is in options, else default
                     idx = source_cols.index(curr_val) if curr_val in source_cols else 0
                     selected_source = col2.selectbox(f"Source for {t_field}", source_cols, index=idx, key=f"src_{t_field}")
                     updated_mappings[t_field] = selected_source
                     
-                    # Logic Button
                     if col3.button(f"Value Logic ({len(updated_value_maps.get(t_field, []))})", key=f"logic_{t_field}"):
                         st.session_state['active_mapping_field'] = t_field
 
-            # Save Mapping Changes
             if st.button("Save Configuration"):
                 config['mappings'] = updated_mappings
                 conn = get_db_connection()
@@ -488,9 +515,7 @@ def main_app():
                 field = st.session_state['active_mapping_field']
                 st.markdown("---")
                 st.info(f"Defining Value Mapping for: **{field}**")
-                
                 vm_list = updated_value_maps.get(field, [])
-                
                 c1, c2, c3 = st.columns([2, 2, 1])
                 src_val = c1.text_input("Old Value", key="vm_old")
                 tgt_val = c2.text_input("New Value", key="vm_new")
@@ -500,10 +525,8 @@ def main_app():
                         updated_value_maps[field] = vm_list
                         config['value_maps'] = updated_value_maps
                         st.rerun()
-
                 for i, vm in enumerate(vm_list):
                     st.write(f"{i+1}. '{vm['old']}' ➔ '{vm['new']}'")
-                
                 if st.button("Close Logic Editor"):
                     del st.session_state['active_mapping_field']
                     st.rerun()
@@ -520,10 +543,17 @@ def main_app():
             if st.button("Start Process"):
                  with st.spinner("Processing..."):
                      time.sleep(2)
-                     df['Cluster_ID'] = np.random.randint(1, len(df)//2, size=len(df))
-                     df['Confidence'] = np.random.uniform(0.7, 0.99, size=len(df))
-                     st.dataframe(df)
-                     st.success("Deduplication Complete")
+                     # Mock logic if library missing
+                     if not HAS_DEDUPE:
+                        st.warning("Pandas-Dedupe library missing. Simulating results.")
+                        df['Cluster_ID'] = np.random.randint(1, len(df)//2, size=len(df))
+                        df['Confidence'] = np.random.uniform(0.7, 0.99, size=len(df))
+                        st.dataframe(df)
+                     else:
+                        st.success("Library found! (Mock execution for speed in demo)")
+                        df['Cluster_ID'] = np.random.randint(1, len(df)//2, size=len(df))
+                        df['Confidence'] = np.random.uniform(0.7, 0.99, size=len(df))
+                        st.dataframe(df)
 
     # 6. DQ RULES CONFIGURATION
     elif selected_view == "DQ Rules Config":
@@ -545,29 +575,24 @@ def main_app():
             
             if selected_table_str:
                 sel_domain, sel_table = selected_table_str.split(" - ")
-                
-                # --- NEW: VIEW COLUMNS (MAPPED) ---
                 conn = get_db_connection()
                 file_info = conn.execute("SELECT file_path FROM data_log WHERE project_id=? AND domain=? AND table_name=?", 
                                         (proj_id, sel_domain, sel_table)).fetchone()
                 conn.close()
                 cols = []
                 if file_info:
-                    # USE MAPPED DATA HELPER
                     _, mapped_cols = get_mapped_dataframe(proj_id, sel_domain, sel_table, file_info[0])
-                    # If mapped cols exist, show them. Else fallback to raw cols if no mapping logic
-                    if mapped_cols:
-                        cols = mapped_cols
-                    else:
-                        try:
-                            temp_df = pd.read_csv(file_info[0], nrows=0) if file_info[0].endswith('.csv') else pd.read_excel(file_info[0], nrows=0)
-                            cols = temp_df.columns.tolist()
-                        except: pass
+                    cols = mapped_cols if mapped_cols else []
+                    if not cols:
+                         # Fallback if no mapping
+                         if os.path.exists(file_info[0]):
+                             temp_df = pd.read_csv(file_info[0], nrows=0) if file_info[0].endswith('.csv') else pd.read_excel(file_info[0], nrows=0)
+                             cols = temp_df.columns.tolist()
 
                 st.caption("Available Columns (Target Structure):")
                 st.code(", ".join(cols), language="text")
                 
-                # --- RULE EDITOR ---
+                # Rule Editor
                 st.markdown("---")
                 col1, col2 = st.columns([1, 1])
                 
@@ -585,18 +610,14 @@ def main_app():
                     if st.button("Generate Python Logic 🤖"):
                         code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
                         st.session_state['edit_code'] = code
-                        # Force rerun to display code in text area
                         st.rerun()
                 
                 with col2:
                     st.subheader("Review & Save")
-                    # Bind text area to session state key to capture manual edits
                     code_input = st.text_area("Python Code", value=st.session_state['edit_code'], height=200, key="txt_code_area")
                     
                     if st.button("Save Rule"):
-                        # Read from key directly to ensure we get latest edit
                         final_code = st.session_state['txt_code_area']
-                        
                         if r_name and final_code:
                             conn = get_db_connection()
                             if st.session_state['edit_rule_id']:
@@ -609,21 +630,18 @@ def main_app():
                                 st.success("Rule Created!")
                             conn.commit()
                             conn.close()
-                            
                             st.session_state['edit_rule_id'] = None
                             st.session_state['edit_name'] = ""
                             st.session_state['edit_desc'] = ""
                             st.session_state['edit_code'] = ""
                             st.rerun()
 
-                # --- EXISTING RULES LIST WITH EDIT ---
                 st.markdown("---")
                 st.subheader(f"Existing Rules for {sel_table}")
                 conn = get_db_connection()
                 rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", 
                                           conn, params=(proj_id, sel_domain, sel_table))
                 conn.close()
-                
                 if not rules.empty:
                     for i, r in rules.iterrows():
                         rc1, rc2, rc3 = st.columns([1, 3, 1])
@@ -645,4 +663,115 @@ def main_app():
         
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
-        tables = pd.read_sql_query
+        tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
+        conn.close()
+        
+        if tables.empty: return
+        
+        table_options = {f"{r['domain']} - {r['table_name']}": r['file_path'] for i, r in tables.iterrows()}
+        selected_table_key = st.selectbox("Select Dataset to Cleanse", list(table_options.keys()))
+        
+        if selected_table_key:
+            file_path = table_options[selected_table_key]
+            sel_domain, sel_table = selected_table_key.split(" - ")
+            
+            # --- LOAD MAPPED DATA ---
+            if 'steward_df' not in st.session_state:
+                mapped_df, _ = get_mapped_dataframe(proj_id, sel_domain, sel_table, file_path)
+                st.session_state['steward_df'] = mapped_df
+            
+            conn = get_db_connection()
+            rules_df = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", 
+                                         conn, params=(proj_id, sel_domain, sel_table))
+            conn.close()
+            
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                if st.button("RUN DQ ANALYSIS ⚡", type="primary", use_container_width=True):
+                    df = st.session_state['steward_df'].copy()
+                    for idx, rule in rules_df.iterrows():
+                        rule_name = rule['rule_name']
+                        code = rule['python_code']
+                        local_scope = {}
+                        try:
+                            exec(code, {}, local_scope)
+                            validate_func = local_scope.get('validate_row')
+                            if validate_func:
+                                results = []
+                                justifications = []
+                                for i, row in df.iterrows():
+                                    try:
+                                        is_valid = validate_func(row.to_dict())
+                                        results.append("Valid" if is_valid else "Invalid")
+                                        justifications.append("Rule Passed" if is_valid else rule['rule_description'])
+                                    except Exception as e:
+                                        results.append("Error")
+                                        justifications.append(str(e))
+                                df[f"{rule_name}_Status"] = results
+                                df[f"{rule_name}_Justification"] = justifications
+                        except Exception as e: st.error(f"Error in rule {rule_name}: {e}")
+                    st.session_state['steward_df'] = df
+                    st.success("Analysis Complete")
+
+            # --- SINGLE EDITOR ---
+            edited_df = st.data_editor(st.session_state['steward_df'], num_rows="dynamic", use_container_width=True, key="main_steward_editor")
+            
+            if st.button("Save Changes to Disk"):
+                if file_path.endswith('.csv'): edited_df.to_csv(file_path, index=False)
+                else: edited_df.to_excel(file_path, index=False)
+                st.session_state['steward_df'] = edited_df
+                st.success("Data Saved Successfully! (File updated with Target Structure)")
+
+    # 8. DATA EXPLORATION
+    elif selected_view == "Data Exploration":
+        st.title("Data Exploration & AI Agent")
+        if not st.session_state['active_project']:
+            st.error("Select Active Project")
+            return
+            
+        proj_id = st.session_state['active_project']['id']
+        conn = get_db_connection()
+        tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
+        conn.close()
+        
+        table_options = {f"{r['domain']} - {r['table_name']}": r['file_path'] for i, r in tables.iterrows()}
+        selected_table_key = st.selectbox("Select Dataset to Explore", list(table_options.keys()))
+        
+        if selected_table_key:
+            file_path = table_options[selected_table_key]
+            sel_domain, sel_table = selected_table_key.split(" - ")
+            
+            df, _ = get_mapped_dataframe(proj_id, sel_domain, sel_table, file_path)
+            
+            st.write("Preview (Target Structure):", df.head())
+            user_query = st.text_area("Ask the AI", placeholder="e.g. Delete rows where ID is empty")
+            
+            if st.button("Execute"):
+                system_prompt = f"You are a Python Data Analyst. Data columns: {df.columns.tolist()}. Return ONLY valid Python code acting on 'df'."
+                api_key = st.session_state.get('api_key')
+                provider = st.session_state['active_project']['llm_provider']
+                
+                if not api_key:
+                    st.warning("Simulation Mode")
+                    st.code("df.describe()")
+                else:
+                    code = query_llm(provider, api_key, user_query, system_prompt)
+                    st.code(code, language='python')
+                    try:
+                        local_scope = {'df': df}
+                        exec(code, {}, local_scope)
+                        new_df = local_scope.get('df')
+                        if isinstance(new_df, pd.DataFrame):
+                            st.dataframe(new_df.head())
+                            if st.button("Save Changes"):
+                                if file_path.endswith('.csv'): new_df.to_csv(file_path, index=False)
+                                else: new_df.to_excel(file_path, index=False)
+                                st.success("Updated!")
+                    except Exception as e: st.error(f"Error: {e}")
+
+# --- RUN APP ---
+init_db()
+if not st.session_state['authenticated']:
+    login_page()
+else:
+    main_app()
