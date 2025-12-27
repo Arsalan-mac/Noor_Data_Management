@@ -297,6 +297,12 @@ def main_app():
             if total_checks > 0:
                 dq_score = int((results_df['pass_count'].sum() / total_checks) * 100)
 
+        # -- DISPLAY DOMAINS (New Visual) --
+        if domains:
+            st.info(f"**Applicable Domains:** {', '.join(domains)}")
+        else:
+            st.warning("No Domains Applicable yet (No data ingested).")
+
         # Top Metric Cards
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Ingested Tables", total_tables)
@@ -602,9 +608,10 @@ def main_app():
                 {head_csv}
                 
                 INSTRUCTIONS:
-                1. If the user asks a question, answer it. If you need to calculate something (count, sum, filter), write Python code wrapped in ```python blocks.
-                2. If the user asks to MODIFY data (delete, update, standardise), write Python code to apply changes to 'df'.
-                3. ALWAYS print the result of your calculation using `print()`.
+                1. Answer questions naturally.
+                2. Only generate Python code (wrapped in ```python ... ```) if data manipulation or complex calculation is explicitly required.
+                3. If modifying data, apply changes to 'df'.
+                4. ALWAYS print the result of your calculation using `print()`.
                 """
                 
                 api_key = st.session_state.get('api_key')
