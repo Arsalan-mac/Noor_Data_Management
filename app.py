@@ -6,6 +6,7 @@ import os
 import io
 import time
 import json
+import re
 from streamlit_option_menu import option_menu
 import openai
 import google.generativeai as genai
@@ -75,6 +76,65 @@ def init_db():
 def get_db_connection():
     return sqlite3.connect(DB_FILE)
 
+# --- DATA TRANSFORMATION HELPER ---
+def get_mapped_dataframe(proj_id, domain, table_name, file_path):
+    """
+    Reads the raw file and applies column mappings and value logic defined in 'Data Mapping'.
+    Returns a DataFrame with Target Columns.
+    """
+    # 1. Read Raw Data
+    if file_path.endswith('.csv'): 
+        df = pd.read_csv(file_path)
+    else: 
+        df = pd.read_excel(file_path)
+
+    # 2. Fetch Mapping Config
+    conn = get_db_connection()
+    res = conn.execute("SELECT config_json FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", 
+                       (proj_id, domain, table_name)).fetchone()
+    conn.close()
+
+    if not res:
+        return df, [] # Return raw df if no mapping
+
+    config = json.loads(res[0])
+    target_fields = config.get('target_fields', [])
+    mappings = config.get('mappings', {})
+    value_maps = config.get('value_maps', {})
+
+    # 3. Apply Column Mapping (Source -> Target)
+    # Invert mapping: {Target: Source} -> {Source: Target} for renaming
+    rename_dict = {}
+    valid_targets = []
+    
+    for target, source in mappings.items():
+        if source and source != "-- Select --":
+            rename_dict[source] = target
+            valid_targets.append(target)
+    
+    df = df.rename(columns=rename_dict)
+    
+    # 4. Filter to keep only mapped target columns (optional, strictly speaking we usually keep only target)
+    # For user friendliness, we try to keep only valid targets, but if empty, keep all
+    if valid_targets:
+        # Keep columns that match target fields (mapped ones)
+        # Note: If a source column wasn't mapped, it won't be in rename_dict keys, so it stays as source name.
+        # We generally want to filter to ONLY the Target Template structure.
+        available_cols = df.columns.tolist()
+        final_cols = [c for c in valid_targets if c in available_cols]
+        df = df[final_cols]
+
+    # 5. Apply Value Logic
+    for target_col, rules in value_maps.items():
+        if target_col in df.columns:
+            for rule in rules:
+                old_val = rule['old']
+                new_val = rule['new']
+                # Strict string replacement for demo
+                df[target_col] = df[target_col].replace(old_val, new_val)
+
+    return df, target_fields
+
 # --- AI HELPER FUNCTIONS ---
 def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data assistant."):
     if not api_key:
@@ -106,21 +166,29 @@ def generate_python_rule(description, columns, provider, api_key):
     You are a Python Code Generator for Data Quality. 
     Output ONLY a valid Python function named 'validate_row'. 
     The function takes a single argument 'row' (a dictionary) and returns True (Valid) or False (Invalid).
-    Do not use markdown formatting like ```python. Just the code.
-    Handle potential missing keys or type errors gracefully with try/except returning False.
+    
+    IMPORTANT:
+    1. Do NOT include markdown formatting (like ```python or ```). 
+    2. Output raw code only.
+    3. Handle potential missing keys gracefully.
     """
     
     prompt = f"""
-    Available Columns: {columns}
-    Rule Description: {description}
+    The DataFrame columns are: {columns}
+    Rule Requirement: {description}
     
-    Generate the 'validate_row' function.
+    Generate the 'validate_row(row)' function now.
     """
     
     if not api_key:
-        return f"# AI Simulation for: {description}\ndef validate_row(row):\n    # TODO: Implement logic for {columns}\n    return True"
+        return f"# AI Simulation for: {description}\ndef validate_row(row):\n    # Logic for columns: {columns}\n    return True"
         
-    return query_llm(provider, api_key, prompt, system_prompt)
+    code = query_llm(provider, api_key, prompt, system_prompt)
+    
+    # Post-processing to clean Markdown if LLM ignores instructions
+    code = re.sub(r'```python', '', code)
+    code = re.sub(r'```', '', code)
+    return code.strip()
 
 # --- AUTHENTICATION ---
 if 'authenticated' not in st.session_state:
@@ -326,7 +394,7 @@ def main_app():
                     if os.path.exists(row['file_path']): os.remove(row['file_path'])
                     st.rerun()
 
-    # 4. DATA MAPPING (NEW PAGE)
+    # 4. DATA MAPPING
     elif selected_view == "Data Mapping":
         st.title("Data Mapping Workbench")
         
@@ -415,7 +483,7 @@ def main_app():
                 conn.close()
                 st.success("Configuration Saved!")
 
-            # 3. Value Mapping Modal (Using Expander as Modal surrogate)
+            # 3. Value Mapping Modal
             if 'active_mapping_field' in st.session_state:
                 field = st.session_state['active_mapping_field']
                 st.markdown("---")
@@ -431,10 +499,8 @@ def main_app():
                         vm_list.append({"old": src_val, "new": tgt_val})
                         updated_value_maps[field] = vm_list
                         config['value_maps'] = updated_value_maps
-                        # Auto-save to session state dict (persist to DB on main Save)
                         st.rerun()
 
-                # List Rules
                 for i, vm in enumerate(vm_list):
                     st.write(f"{i+1}. '{vm['old']}' ➔ '{vm['new']}'")
                 
@@ -480,25 +546,31 @@ def main_app():
             if selected_table_str:
                 sel_domain, sel_table = selected_table_str.split(" - ")
                 
-                # --- NEW: VIEW COLUMNS ---
+                # --- NEW: VIEW COLUMNS (MAPPED) ---
                 conn = get_db_connection()
                 file_info = conn.execute("SELECT file_path FROM data_log WHERE project_id=? AND domain=? AND table_name=?", 
                                         (proj_id, sel_domain, sel_table)).fetchone()
                 conn.close()
                 cols = []
                 if file_info:
-                    try:
-                        temp_df = pd.read_csv(file_info[0], nrows=0) if file_info[0].endswith('.csv') else pd.read_excel(file_info[0], nrows=0)
-                        cols = temp_df.columns.tolist()
-                        st.caption("Available Columns:")
-                        st.code(", ".join(cols), language="text")
-                    except: pass
+                    # USE MAPPED DATA HELPER
+                    _, mapped_cols = get_mapped_dataframe(proj_id, sel_domain, sel_table, file_info[0])
+                    # If mapped cols exist, show them. Else fallback to raw cols if no mapping logic
+                    if mapped_cols:
+                        cols = mapped_cols
+                    else:
+                        try:
+                            temp_df = pd.read_csv(file_info[0], nrows=0) if file_info[0].endswith('.csv') else pd.read_excel(file_info[0], nrows=0)
+                            cols = temp_df.columns.tolist()
+                        except: pass
+
+                st.caption("Available Columns (Target Structure):")
+                st.code(", ".join(cols), language="text")
                 
                 # --- RULE EDITOR ---
                 st.markdown("---")
                 col1, col2 = st.columns([1, 1])
                 
-                # Setup Editing State
                 if 'edit_rule_id' not in st.session_state:
                     st.session_state['edit_rule_id'] = None
                     st.session_state['edit_name'] = ""
@@ -507,35 +579,37 @@ def main_app():
 
                 with col1:
                     st.subheader("Rule Definition")
-                    
-                    # Inputs tied to session state for editing
                     r_name = st.text_input("Rule Name", value=st.session_state['edit_name'], key="input_rname")
                     r_desc = st.text_area("Rule Logic (English)", value=st.session_state['edit_desc'], key="input_rdesc")
                     
                     if st.button("Generate Python Logic 🤖"):
                         code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
                         st.session_state['edit_code'] = code
+                        # Force rerun to display code in text area
+                        st.rerun()
                 
                 with col2:
                     st.subheader("Review & Save")
-                    code_input = st.text_area("Python Code", value=st.session_state['edit_code'], height=200, key="input_rcode")
+                    # Bind text area to session state key to capture manual edits
+                    code_input = st.text_area("Python Code", value=st.session_state['edit_code'], height=200, key="txt_code_area")
                     
                     if st.button("Save Rule"):
-                        if r_name and code_input:
+                        # Read from key directly to ensure we get latest edit
+                        final_code = st.session_state['txt_code_area']
+                        
+                        if r_name and final_code:
                             conn = get_db_connection()
                             if st.session_state['edit_rule_id']:
-                                # UPDATE
                                 conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
-                                             (r_name, r_desc, code_input, st.session_state['edit_rule_id']))
+                                             (r_name, r_desc, final_code, st.session_state['edit_rule_id']))
                                 st.success("Rule Updated!")
                             else:
-                                # INSERT
                                 conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
-                                             (proj_id, sel_domain, sel_table, r_name, r_desc, code_input))
+                                             (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
                                 st.success("Rule Created!")
                             conn.commit()
                             conn.close()
-                            # Clear State
+                            
                             st.session_state['edit_rule_id'] = None
                             st.session_state['edit_name'] = ""
                             st.session_state['edit_desc'] = ""
@@ -571,123 +645,4 @@ def main_app():
         
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
-        tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
-        conn.close()
-        
-        if tables.empty: return
-        
-        table_options = {f"{r['domain']} - {r['table_name']}": r['file_path'] for i, r in tables.iterrows()}
-        selected_table_key = st.selectbox("Select Dataset to Cleanse", list(table_options.keys()))
-        
-        if selected_table_key:
-            file_path = table_options[selected_table_key]
-            sel_domain, sel_table = selected_table_key.split(" - ")
-            
-            if 'steward_df' not in st.session_state:
-                if file_path.endswith('.csv'): df = pd.read_csv(file_path)
-                else: df = pd.read_excel(file_path)
-                st.session_state['steward_df'] = df
-            
-            conn = get_db_connection()
-            rules_df = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", 
-                                         conn, params=(proj_id, sel_domain, sel_table))
-            conn.close()
-            
-            col1, col2 = st.columns([3, 1])
-            with col2:
-                if st.button("RUN DQ ANALYSIS ⚡", type="primary", use_container_width=True):
-                    df = st.session_state['steward_df'].copy()
-                    for idx, rule in rules_df.iterrows():
-                        rule_name = rule['rule_name']
-                        code = rule['python_code']
-                        local_scope = {}
-                        try:
-                            exec(code, {}, local_scope)
-                            validate_func = local_scope.get('validate_row')
-                            if validate_func:
-                                results = []
-                                justifications = []
-                                for i, row in df.iterrows():
-                                    try:
-                                        is_valid = validate_func(row.to_dict())
-                                        results.append("Valid" if is_valid else "Invalid")
-                                        justifications.append("Rule Passed" if is_valid else rule['rule_description'])
-                                    except Exception as e:
-                                        results.append("Error")
-                                        justifications.append(str(e))
-                                df[f"{rule_name}_Status"] = results
-                                df[f"{rule_name}_Justification"] = justifications
-                        except Exception as e: st.error(f"Error in rule {rule_name}: {e}")
-                    st.session_state['steward_df'] = df
-                    st.success("Analysis Complete")
-
-            st.data_editor(st.session_state['steward_df'], num_rows="dynamic", use_container_width=True, key="data_editor_steward")
-            
-            if st.button("Save Changes to Disk"):
-                # Retrieve edited data from st.session_state if key is used, or assume direct edit updates state reference logic in newer Streamlit
-                # NOTE: In recent Streamlit, data_editor returns the new DF. We need to capture it.
-                # However, since I used key above, I should capture return value.
-                # Let's fix the logic flow for robustness:
-                pass 
-                # (The data_editor allows direct editing, but to save we typically need to capture the return value in the render loop)
-                # Correcting for next render:
-            
-            # Re-implementing correctly:
-            edited_df = st.data_editor(st.session_state['steward_df'], num_rows="dynamic", use_container_width=True)
-            if st.button("Save to Disk"):
-                if file_path.endswith('.csv'): edited_df.to_csv(file_path, index=False)
-                else: edited_df.to_excel(file_path, index=False)
-                st.session_state['steward_df'] = edited_df
-                st.success("Saved!")
-
-    # 8. DATA EXPLORATION
-    elif selected_view == "Data Exploration":
-        st.title("Data Exploration & AI Agent")
-        if not st.session_state['active_project']:
-            st.error("Select Active Project")
-            return
-            
-        proj_id = st.session_state['active_project']['id']
-        conn = get_db_connection()
-        tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
-        conn.close()
-        
-        table_options = {f"{r['domain']} - {r['table_name']}": r['file_path'] for i, r in tables.iterrows()}
-        selected_table_key = st.selectbox("Select Dataset to Explore", list(table_options.keys()))
-        
-        if selected_table_key:
-            file_path = table_options[selected_table_key]
-            if file_path.endswith('.csv'): df = pd.read_csv(file_path)
-            else: df = pd.read_excel(file_path)
-            st.write("Preview:", df.head())
-            user_query = st.text_area("Ask the AI", placeholder="e.g. Delete rows where ID is empty")
-            
-            if st.button("Execute"):
-                system_prompt = f"You are a Python Data Analyst. Data columns: {df.columns.tolist()}. Return ONLY valid Python code acting on 'df'."
-                api_key = st.session_state.get('api_key')
-                provider = st.session_state['active_project']['llm_provider']
-                
-                if not api_key:
-                    st.warning("Simulation Mode")
-                    st.code("df.describe()")
-                else:
-                    code = query_llm(provider, api_key, user_query, system_prompt)
-                    st.code(code, language='python')
-                    try:
-                        local_scope = {'df': df}
-                        exec(code, {}, local_scope)
-                        new_df = local_scope.get('df')
-                        if isinstance(new_df, pd.DataFrame):
-                            st.dataframe(new_df.head())
-                            if st.button("Save Changes"):
-                                if file_path.endswith('.csv'): new_df.to_csv(file_path, index=False)
-                                else: new_df.to_excel(file_path, index=False)
-                                st.success("Updated!")
-                    except Exception as e: st.error(f"Error: {e}")
-
-# --- RUN APP ---
-init_db()
-if not st.session_state['authenticated']:
-    login_page()
-else:
-    main_app()
+        tables = pd.read_sql_query
