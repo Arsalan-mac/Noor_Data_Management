@@ -193,13 +193,13 @@ def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data a
         return f"Error: {str(e)}"
 
 def generate_python_rule(description, columns, provider, api_key):
-    system_prompt = """
-    You are a data quality assistant. 
-    Convert the following data quality rule in English to a Python pandas boolean mask expression.
-    Do NOT wrap it in df[...].
-    Return only the boolean expression (with proper parentheses), not a function, not an explanation.
-    Assume the dataframe is named 'df'.
-    """
+    # Matches the user's Dynamic_DQ.py prompt structure for Boolean Masks
+    system_prompt = (
+        "You are a data quality assistant. "
+        "Convert the following data quality rule in English to a Python pandas boolean mask expression. "
+        "Do NOT wrap it in df[...]. "
+        "Return only the boolean expression (with proper parentheses), not a function, not an explanation."
+    )
     
     prompt = f"""
     The DataFrame columns are: {columns}
@@ -210,7 +210,9 @@ def generate_python_rule(description, columns, provider, api_key):
     """
     
     if not api_key:
-        return f"# AI Simulation for: {description}\n(df['{columns[0] if columns else 'Col'}'] != None)"
+        # Better Fallback simulation
+        col = columns[0] if columns else 'Col'
+        return f"# AI Simulation for: {description}\n(df['{col}'].notna()) & (df['{col}'] != '')"
         
     code = query_llm(provider, api_key, prompt, system_prompt)
     
@@ -582,7 +584,6 @@ def main_app():
                     _, mapped_cols = get_mapped_dataframe(proj_id, sel_domain, sel_table, file_info[0])
                     cols = mapped_cols if mapped_cols else []
                     if not cols:
-                         # Fallback if no mapping
                          if os.path.exists(file_info[0]):
                              temp_df = pd.read_csv(file_info[0], nrows=0) if file_info[0].endswith('.csv') else pd.read_excel(file_info[0], nrows=0)
                              cols = temp_df.columns.tolist()
@@ -607,17 +608,21 @@ def main_app():
                     
                     if st.button("Generate Python Logic 🤖"):
                         code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
-                        st.session_state['edit_code'] = code
-                        # FORCE UPDATE TEXT AREA KEY to show immediately
+                        # --- CRITICAL FIX: Update the KEY bound to the text area ---
                         st.session_state['txt_code_area'] = code
+                        # Also update local state
+                        st.session_state['edit_code'] = code
                         st.rerun()
                 
                 with col2:
                     st.subheader("Review & Save")
-                    code_input = st.text_area("Python Code", value=st.session_state['edit_code'], height=200, key="txt_code_area")
+                    # Bound to 'txt_code_area' key so updates propagate immediately
+                    code_input = st.text_area("Python Code", key="txt_code_area", height=200)
                     
                     if st.button("Save Rule"):
+                        # Read from the widget key
                         final_code = st.session_state['txt_code_area']
+                        
                         if r_name and final_code:
                             conn = get_db_connection()
                             if st.session_state['edit_rule_id']:
@@ -630,10 +635,13 @@ def main_app():
                                 st.success("Rule Created!")
                             conn.commit()
                             conn.close()
+                            
+                            # Clean up
                             st.session_state['edit_rule_id'] = None
                             st.session_state['edit_name'] = ""
                             st.session_state['edit_desc'] = ""
                             st.session_state['edit_code'] = ""
+                            st.session_state['txt_code_area'] = ""
                             st.rerun()
 
                 st.markdown("---")
@@ -652,7 +660,6 @@ def main_app():
                             st.session_state['edit_name'] = r['rule_name']
                             st.session_state['edit_desc'] = r['rule_description']
                             st.session_state['edit_code'] = r['python_code']
-                            # Also update the text area key so it populates immediately
                             st.session_state['txt_code_area'] = r['python_code']
                             st.rerun()
 
@@ -697,19 +704,21 @@ def main_app():
                         code = rule['python_code']
                         
                         try:
-                            # Evaluate expression against DataFrame using eval()
-                            # Expecting a Boolean Series/Mask
-                            # Pass 'df', 'pd', 'np' in local scope just in case
+                            # --- EXECUTION FIX: Using eval() for Boolean Masks (as per Dynamic_DQ.py) ---
+                            # eval returns a Boolean Series (True/False)
                             local_scope = {'df': df, 'pd': pd, 'np': np}
                             
-                            # If code is "(df['A']>5)", eval returns the series directly
-                            result_mask = eval(code, {}, local_scope)
+                            # Evaluate rule to get mask
+                            # IMPORTANT: Dynamic_DQ.py format typically implies True = Condition Met (Pass)
+                            # E.g. (df['A'] > 0) -> True means Valid
+                            result_mask = eval(code, {"__builtins__": None}, local_scope)
                             
                             if isinstance(result_mask, pd.Series):
                                 df[f"{rule_name}_Status"] = result_mask.map({True: "Valid", False: "Invalid"})
+                                # For Invalid rows, show description. Valid rows get "Rule Passed"
                                 df[f"{rule_name}_Justification"] = result_mask.map({True: "Rule Passed", False: rule['rule_description']})
                             else:
-                                st.warning(f"Rule {rule_name} did not return a Series (Got {type(result_mask)})")
+                                st.warning(f"Rule {rule_name} evaluation failed. Expected Boolean Series, got {type(result_mask)}")
 
                         except Exception as e:
                             st.error(f"Error executing rule {rule_name}: {e}")
@@ -724,7 +733,7 @@ def main_app():
                 if file_path.endswith('.csv'): edited_df.to_csv(file_path, index=False)
                 else: edited_df.to_excel(file_path, index=False)
                 st.session_state['steward_df'] = edited_df
-                st.success("Data Saved Successfully! (File updated with Target Structure)")
+                st.success("Data Saved Successfully!")
 
     # 8. DATA EXPLORATION
     elif selected_view == "Data Exploration":
