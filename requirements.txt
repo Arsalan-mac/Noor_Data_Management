@@ -8,3 +8,4 @@ dedupe
 pandas-dedupe
 sqlalchemy
 openpyxl
+plotly
