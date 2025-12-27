@@ -260,6 +260,53 @@ def login_page():
         
         st.info("Demo Credentials: \n\nAdmin: admin@company.com / admin \n\nSteward: steward@company.com / 123")
 
+# --- CALLBACKS (Fix State & Delete Rule) ---
+def save_rule_callback(proj_id, sel_domain, sel_table):
+    r_name = st.session_state.get('input_rname', '')
+    r_desc = st.session_state.get('input_rdesc', '')
+    final_code = st.session_state.get('txt_code_area', '')
+    
+    if r_name and final_code:
+        conn = get_db_connection()
+        if st.session_state['edit_rule_id']:
+            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
+                            (r_name, r_desc, final_code, st.session_state['edit_rule_id']))
+            st.toast("Rule Updated!")
+        else:
+            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
+                            (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
+            st.toast("Rule Created!")
+        conn.commit()
+        conn.close()
+        
+        # Clean up
+        st.session_state['edit_rule_id'] = None
+        st.session_state['edit_name'] = ""
+        st.session_state['edit_desc'] = ""
+        st.session_state['edit_code'] = ""
+        st.session_state['txt_code_area'] = ""
+
+def load_rule_callback(r_id, r_name, r_desc, r_code):
+    st.session_state['edit_rule_id'] = r_id
+    st.session_state['edit_name'] = r_name
+    st.session_state['edit_desc'] = r_desc
+    st.session_state['edit_code'] = r_code
+    st.session_state['txt_code_area'] = r_code
+
+def delete_rule_callback(r_id):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM dq_rules WHERE id=?", (r_id,))
+    conn.commit()
+    conn.close()
+    st.toast("Rule Deleted!")
+    # If we were editing the deleted rule, clear the editor
+    if st.session_state.get('edit_rule_id') == r_id:
+        st.session_state['edit_rule_id'] = None
+        st.session_state['edit_name'] = ""
+        st.session_state['edit_desc'] = ""
+        st.session_state['edit_code'] = ""
+        st.session_state['txt_code_area'] = ""
+
 # --- MAIN APP LOGIC ---
 def main_app():
     # --- SIDEBAR ---
@@ -469,18 +516,30 @@ def main_app():
             st.subheader("1. Target Template Definition")
             with st.expander("Manage Target Fields", expanded=True):
                 c1, c2 = st.columns([3, 1])
-                new_field = c1.text_input("Add Target Field")
-                if c2.button("Add Field"):
-                    if new_field and new_field not in config['target_fields']:
-                        config['target_fields'].append(new_field)
-                        # Save
-                        conn = get_db_connection()
-                        conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
-                        conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", 
-                                     (proj_id, sel_domain, sel_table, json.dumps(config)))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
+                new_field_input = c1.text_input("Add Target Field(s) (comma-separated)", placeholder="Material_ID, Description, Plant")
+                if c2.button("Add Field(s)"):
+                    if new_field_input:
+                        # Split string by comma and strip whitespace
+                        new_fields = [f.strip() for f in new_field_input.split(',') if f.strip()]
+                        added_count = 0
+                        for nf in new_fields:
+                            if nf not in config['target_fields']:
+                                config['target_fields'].append(nf)
+                                added_count += 1
+                        
+                        if added_count > 0:
+                            # Save
+                            conn = get_db_connection()
+                            conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
+                            conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", 
+                                         (proj_id, sel_domain, sel_table, json.dumps(config)))
+                            conn.commit()
+                            conn.close()
+                            st.success(f"Added {added_count} fields!")
+                            st.rerun()
+                        else:
+                            st.warning("Fields already exist.")
+                
                 st.write("Current Target Fields:", ", ".join(config['target_fields']))
 
             # 2. Field Mapping
@@ -619,30 +678,8 @@ def main_app():
                     # Bound to 'txt_code_area' key so updates propagate immediately
                     code_input = st.text_area("Python Code", key="txt_code_area", height=200)
                     
-                    if st.button("Save Rule"):
-                        # Read from the widget key
-                        final_code = st.session_state['txt_code_area']
-                        
-                        if r_name and final_code:
-                            conn = get_db_connection()
-                            if st.session_state['edit_rule_id']:
-                                conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
-                                             (r_name, r_desc, final_code, st.session_state['edit_rule_id']))
-                                st.success("Rule Updated!")
-                            else:
-                                conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
-                                             (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
-                                st.success("Rule Created!")
-                            conn.commit()
-                            conn.close()
-                            
-                            # Clean up
-                            st.session_state['edit_rule_id'] = None
-                            st.session_state['edit_name'] = ""
-                            st.session_state['edit_desc'] = ""
-                            st.session_state['edit_code'] = ""
-                            st.session_state['txt_code_area'] = ""
-                            st.rerun()
+                    # Using Callback to safely Save and Clear state
+                    st.button("Save Rule", on_click=save_rule_callback, args=(proj_id, sel_domain, sel_table))
 
                 st.markdown("---")
                 st.subheader(f"Existing Rules for {sel_table}")
@@ -652,16 +689,13 @@ def main_app():
                 conn.close()
                 if not rules.empty:
                     for i, r in rules.iterrows():
-                        rc1, rc2, rc3 = st.columns([1, 3, 1])
+                        rc1, rc2, rc3, rc4 = st.columns([1, 3, 0.5, 0.5])
                         rc1.write(f"**{r['rule_name']}**")
                         rc2.caption(r['rule_description'])
-                        if rc3.button("Edit", key=f"edit_rule_{r['id']}"):
-                            st.session_state['edit_rule_id'] = r['id']
-                            st.session_state['edit_name'] = r['rule_name']
-                            st.session_state['edit_desc'] = r['rule_description']
-                            st.session_state['edit_code'] = r['python_code']
-                            st.session_state['txt_code_area'] = r['python_code']
-                            st.rerun()
+                        # Edit Button (Callback)
+                        rc3.button("Edit", key=f"edit_rule_{r['id']}", on_click=load_rule_callback, args=(r['id'], r['rule_name'], r['rule_description'], r['python_code']))
+                        # Delete Button (Callback)
+                        rc4.button("❌", key=f"del_rule_{r['id']}", on_click=delete_rule_callback, args=(r['id'],))
 
     # 7. DATA STEWARDSHIP
     elif selected_view == "Data Stewardship":
