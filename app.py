@@ -36,6 +36,13 @@ try:
 except ImportError:
     HAS_DEDUPE = False
 
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(
     page_title="Noor Data Governance",
@@ -279,56 +286,80 @@ def main_app():
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
         
-        # Metrics Calculation
+        # Load Data
         tables_df = pd.read_sql_query("SELECT domain, table_name, row_count FROM data_log WHERE project_id=?", conn, params=(proj_id,))
+        results_df = pd.read_sql_query("SELECT domain, table_name, rule_name, pass_count, fail_count FROM dq_results_log WHERE project_id=?", conn, params=(proj_id,))
         rule_count = conn.execute("SELECT COUNT(*) FROM dq_rules WHERE project_id=?", (proj_id,)).fetchone()[0]
-        results_df = pd.read_sql_query("SELECT rule_name, pass_count, fail_count FROM dq_results_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
 
-        # Overview Stats
-        domains = tables_df['domain'].unique().tolist()
+        # --- LEVEL 1: OVERALL PROJECT HEALTH ---
         total_rows = tables_df['row_count'].sum() if not tables_df.empty else 0
         total_tables = len(tables_df)
         
-        # DQ Score Logic
-        dq_score = 100
-        if not results_df.empty:
-            total_checks = results_df['pass_count'].sum() + results_df['fail_count'].sum()
-            if total_checks > 0:
-                dq_score = int((results_df['pass_count'].sum() / total_checks) * 100)
-
-        # -- DISPLAY DOMAINS (New Visual) --
-        if domains:
-            st.info(f"**Applicable Domains:** {', '.join(domains)}")
-        else:
-            st.warning("No Domains Applicable yet (No data ingested).")
-
-        # Top Metric Cards
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Ingested Tables", total_tables)
-        c2.metric("Total Rows", f"{total_rows:,}")
-        c3.metric("Active Rules", rule_count)
-        c4.metric("Overall DQ Score", f"{dq_score}%", delta_color="normal")
-
-        col1, col2 = st.columns([1, 1])
+        total_pass = results_df['pass_count'].sum() if not results_df.empty else 0
+        total_fail = results_df['fail_count'].sum() if not results_df.empty else 0
+        total_checks = total_pass + total_fail
         
-        # Rows per Table
-        with col1:
-            st.subheader("Rows per Table")
-            if not tables_df.empty:
-                st.dataframe(tables_df[['domain', 'table_name', 'row_count']], use_container_width=True, hide_index=True)
-            else:
-                st.info("No data ingested.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Records Ingested", f"{total_rows:,}")
+        c2.metric("Total Tables", total_tables)
+        c3.metric("Active DQ Rules", rule_count)
 
-        # DQ Breakdown
-        with col2:
-            st.subheader("DQ Breakdown (Failures per Rule)")
-            if not results_df.empty:
-                # Group by rule name to aggregate latest runs
-                rule_stats = results_df.groupby('rule_name')[['fail_count']].sum().reset_index()
-                st.bar_chart(rule_stats.set_index('rule_name'))
+        # Overall Project Donut
+        if HAS_PLOTLY and total_checks > 0:
+            fig = go.Figure(data=[go.Pie(labels=['Valid', 'Invalid'], values=[total_pass, total_fail], hole=.6, marker_colors=['#22c55e', '#ef4444'])])
+            fig.update_layout(title_text=f"Project DQ Score: {int(total_pass/total_checks*100)}%", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white'), height=300)
+            st.plotly_chart(fig, use_container_width=True)
+        elif not HAS_PLOTLY:
+            st.warning("Plotly library not installed. Install it for charts.")
+
+        st.divider()
+
+        # --- LEVEL 2: DRILL DOWN PER DOMAIN ---
+        st.subheader("Data Quality Breakdown")
+        
+        # Available Domains
+        domains = sorted(tables_df['domain'].unique().tolist())
+        if not domains:
+            st.info("No data ingested yet.")
+        else:
+            selected_domain = st.selectbox("Select Domain for Drill-down", ["All Domains"] + domains)
+            
+            # Filter Data
+            if selected_domain != "All Domains":
+                filtered_res = results_df[results_df['domain'] == selected_domain]
+                filtered_tables = tables_df[tables_df['domain'] == selected_domain]
             else:
-                st.info("No DQ Analysis run yet.")
+                filtered_res = results_df
+                filtered_tables = tables_df
+
+            # Domain Level Bar Chart (Pass vs Fail)
+            if not filtered_res.empty:
+                # Group by Table to show Table Health within Domain
+                table_stats = filtered_res.groupby('table_name')[['pass_count', 'fail_count']].sum().reset_index()
+                
+                if HAS_PLOTLY:
+                    fig_bar = go.Figure()
+                    fig_bar.add_trace(go.Bar(x=table_stats['table_name'], y=table_stats['pass_count'], name='Valid Rows', marker_color='#22c55e'))
+                    fig_bar.add_trace(go.Bar(x=table_stats['table_name'], y=table_stats['fail_count'], name='Invalid Rows', marker_color='#ef4444'))
+                    fig_bar.update_layout(barmode='stack', title=f"DQ Status by Table ({selected_domain})", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white'), xaxis_title="Table", yaxis_title="Record Checks")
+                    st.plotly_chart(fig_bar, use_container_width=True)
+            
+            # --- LEVEL 3: RULE BREAKDOWN ---
+            st.markdown(f"##### Rule Performance: {selected_domain}")
+            if not filtered_res.empty:
+                # Group by Rule
+                rule_stats = filtered_res.groupby('rule_name')[['pass_count', 'fail_count']].sum().reset_index()
+                rule_stats['Total'] = rule_stats['pass_count'] + rule_stats['fail_count']
+                rule_stats['Error %'] = (rule_stats['fail_count'] / rule_stats['Total'] * 100).round(1)
+                
+                # Show Data Grid
+                st.dataframe(
+                    rule_stats.style.background_gradient(subset=['Error %'], cmap='RdYlGn_r'),
+                    use_container_width=True
+                )
+            else:
+                st.info("No DQ results logged for this selection.")
 
     # 2. PROJECT SETUP
     elif selected_view == "Project Setup":
