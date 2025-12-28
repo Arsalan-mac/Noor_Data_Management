@@ -154,7 +154,9 @@ def generate_python_rule(description, columns, provider, api_key):
         return f"# Demo Mode\n(df['{col}'].notna())"
         
     code = query_llm(provider, api_key, prompt, system_prompt)
-    return re.sub(r'```python|```', '', code).strip()
+    # Strip markdown and quotes that might break execution
+    cleaned = re.sub(r'```python|```', '', code).strip()
+    return cleaned.strip("'").strip('"')
 
 # --- AUTH ---
 if 'authenticated' not in st.session_state:
@@ -182,30 +184,72 @@ def login_page():
                 else: st.error("Invalid credentials.")
         st.info("Demo: admin@company.com / admin")
 
-# --- CALLBACKS & HELPERS ---
+# --- CALLBACKS (CRITICAL FOR STATE SAFETY) ---
+def save_rule_callback(proj_id, sel_domain, sel_table):
+    # Safe retrieval using .get() to avoid KeyError if widgets aren't initialized
+    r_name = st.session_state.get('input_rname', '')
+    # The text area might be updated programmatically, so check both key and state
+    final_code = st.session_state.get('txt_code_area_widget', st.session_state.get('txt_code_area', ''))
+    r_desc = st.session_state.get('input_rdesc', '')
+    
+    if r_name and final_code:
+        conn = get_db_connection()
+        current_id = st.session_state.get('edit_rule_id')
+        if current_id:
+            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
+                            (r_name, r_desc, final_code, current_id))
+            st.toast("Rule Updated!")
+        else:
+            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
+                            (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
+            st.toast("Rule Created!")
+        conn.commit()
+        conn.close()
+        
+        # Reset State safely
+        st.session_state['edit_rule_id'] = None
+        st.session_state['edit_name'] = ""
+        st.session_state['edit_desc'] = ""
+        st.session_state['edit_code'] = ""
+        st.session_state['txt_code_area'] = ""
+        # IMPORTANT: Clear the widget key too to reset the UI
+        st.session_state['txt_code_area_widget'] = ""
+        st.session_state['input_rname'] = ""
+        st.session_state['input_rdesc'] = ""
+
 def load_rule_for_edit(r_id, r_name, r_desc, r_code):
     st.session_state['edit_rule_id'] = r_id
+    # Update internal state
     st.session_state['edit_name'] = r_name
     st.session_state['edit_desc'] = r_desc
     st.session_state['edit_code'] = r_code
     st.session_state['txt_code_area'] = r_code
+    
+    # Update WIDGET keys to force UI refresh on rerun
+    st.session_state['input_rname'] = r_name
+    st.session_state['input_rdesc'] = r_desc
+    st.session_state['txt_code_area_widget'] = r_code
 
 def delete_rule_db(r_id):
     conn = get_db_connection()
     conn.execute("DELETE FROM dq_rules WHERE id=?", (r_id,))
     conn.commit()
     conn.close()
+    st.toast("Rule Deleted!")
     if st.session_state.get('edit_rule_id') == r_id:
         st.session_state['edit_rule_id'] = None
         st.session_state['edit_name'] = ""
         st.session_state['edit_desc'] = ""
         st.session_state['edit_code'] = ""
         st.session_state['txt_code_area'] = ""
+        st.session_state['txt_code_area_widget'] = ""
+        st.session_state['input_rname'] = ""
+        st.session_state['input_rdesc'] = ""
 
 # --- MAIN APP ---
 def main_app():
     # GLOBAL STATE INIT (Prevents KeyErrors)
-    for k in ['edit_rule_id', 'edit_name', 'edit_desc', 'edit_code', 'txt_code_area']:
+    for k in ['edit_rule_id', 'edit_name', 'edit_desc', 'edit_code', 'txt_code_area', 'txt_code_area_widget']:
         if k not in st.session_state: st.session_state[k] = None if k == 'edit_rule_id' else ""
 
     with st.sidebar:
@@ -416,11 +460,14 @@ def main_app():
         with col_studio:
             st.subheader("Rule Editor")
             with st.container(border=True):
-                r_name = st.text_input("Rule Name", value=st.session_state['edit_name'], placeholder="e.g., Check_Active_Status", key="input_rname")
-                r_desc = st.text_area("Requirement (English)", value=st.session_state['edit_desc'], placeholder="e.g., Status must be 'Active'", key="input_rdesc")
+                # Bind value to session state vars, but use 'key' to allow updating them programmatically
+                r_name = st.text_input("Rule Name", value=st.session_state.get('edit_name', ''), placeholder="e.g., Check_Active_Status", key="input_rname")
+                r_desc = st.text_area("Requirement (English)", value=st.session_state.get('edit_desc', ''), placeholder="e.g., Status must be 'Active'", key="input_rdesc")
                 
                 if st.button("✨ Generate Logic"):
                     code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
+                    # Force update the widget key to show result immediately
+                    st.session_state['txt_code_area_widget'] = code
                     st.session_state['txt_code_area'] = code
                     st.rerun()
                 
@@ -439,27 +486,9 @@ def main_app():
                             else: st.error("Error: Must return Boolean Series.")
                         except Exception as e: st.error(f"Error: {e}")
 
-                # --- FIXED SAVE LOGIC ---
                 if c_save.button("💾 Save Rule", type="primary"):
-                    r_code = st.session_state.get('txt_code_area', '')
-                    if r_name and r_code:
-                        conn = get_db_connection()
-                        eid = st.session_state.get('edit_rule_id')
-                        if eid:
-                            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", (r_name, r_desc, r_code, eid))
-                            st.toast("Rule Updated!")
-                        else:
-                            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)", (proj_id, dom, tbl, r_name, r_desc, r_code))
-                            st.toast("Rule Created!")
-                        conn.commit(); conn.close()
-                        # Reset
-                        st.session_state['edit_rule_id'] = None
-                        st.session_state['edit_name'] = ""
-                        st.session_state['edit_desc'] = ""
-                        st.session_state['txt_code_area'] = ""
-                        st.rerun() # Force Reload
-                    else:
-                        st.error("Name and Code required.")
+                    save_rule_callback(proj_id, dom, tbl)
+                    st.rerun()
 
         with col_lib:
             st.subheader("Existing Rules")
@@ -492,11 +521,18 @@ def main_app():
         
         if t_df.empty: return
         sel_k = st.selectbox("Dataset", [f"{r['domain']} - {r['table_name']}" for _, r in t_df.iterrows()])
-        dom, tbl = sel_k.split(" - ")
-        path = t_df[t_df['table_name'] == tbl]['file_path'].values[0]
-
-        if 'steward_df' not in st.session_state:
+        
+        # --- FIXED GRID REFRESH ---
+        # If selection changed, force reload of dataframe
+        if 'current_steward_table' not in st.session_state or st.session_state['current_steward_table'] != sel_k:
+            dom, tbl = sel_k.split(" - ")
+            path = t_df[t_df['table_name'] == tbl]['file_path'].values[0]
             st.session_state['steward_df'], _ = get_mapped_dataframe(proj_id, dom, tbl, path)
+            st.session_state['current_steward_table'] = sel_k
+            # Optional rerun to ensure state is clean, but usually immediate assignment works
+            st.rerun()
+
+        dom, tbl = sel_k.split(" - ")
 
         if st.button("RUN DQ ANALYSIS ⚡", type="primary"):
             df = st.session_state['steward_df'].copy()
