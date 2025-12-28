@@ -9,3 +9,4 @@ pandas-dedupe
 sqlalchemy
 openpyxl
 plotly
+matplotlib
