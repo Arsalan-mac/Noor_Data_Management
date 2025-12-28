@@ -198,19 +198,14 @@ def generate_python_rule(description, columns, provider, api_key):
 
 # --- CALLBACKS ---
 def save_rule_callback(proj_id, sel_domain, sel_table):
-    # Use .get() to avoid KeyError if widgets aren't fully initialized in state
     r_name = st.session_state.get('input_rname', '')
     r_desc = st.session_state.get('input_rdesc', '')
     final_code = st.session_state.get('txt_code_area', '')
-    
     if r_name and final_code:
         conn = get_db_connection()
-        # Use .get() for the ID as well
-        current_id = st.session_state.get('edit_rule_id')
-        
-        if current_id:
+        if st.session_state['edit_rule_id']:
             conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
-                            (r_name, r_desc, final_code, current_id))
+                            (r_name, r_desc, final_code, st.session_state['edit_rule_id']))
             st.toast("Rule Updated!")
         else:
             conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
@@ -218,8 +213,6 @@ def save_rule_callback(proj_id, sel_domain, sel_table):
             st.toast("Rule Created!")
         conn.commit()
         conn.close()
-        
-        # Reset State
         st.session_state['edit_rule_id'] = None
         st.session_state['edit_name'] = ""
         st.session_state['edit_desc'] = ""
@@ -239,8 +232,6 @@ def delete_rule_callback(r_id):
     conn.commit()
     conn.close()
     st.toast("Rule Deleted!")
-    
-    # Use .get() to safely check ID
     if st.session_state.get('edit_rule_id') == r_id:
         st.session_state['edit_rule_id'] = None
         st.session_state['edit_name'] = ""
@@ -276,16 +267,6 @@ def login_page():
 
 # --- MAIN APP ---
 def main_app():
-    # --- GLOBAL INITIALIZATION to prevent KeyErrors ---
-    if 'edit_rule_id' not in st.session_state:
-        st.session_state['edit_rule_id'] = None
-    if 'edit_name' not in st.session_state:
-        st.session_state['edit_name'] = ""
-    if 'edit_desc' not in st.session_state:
-        st.session_state['edit_desc'] = ""
-    if 'edit_code' not in st.session_state:
-        st.session_state['edit_code'] = ""
-        
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state['user']['name']}")
         st.caption(f"Role: {st.session_state['user']['role']}")
