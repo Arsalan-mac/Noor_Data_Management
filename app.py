@@ -100,22 +100,26 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
 
     if not res: return df, [] 
     config = json.loads(res[0])
-    target_fields = config.get('target_fields', [])
     mappings = config.get('mappings', {})
     value_maps = config.get('value_maps', {})
 
+    # 1. Rename Columns
     rename_dict = {source: target for target, source in mappings.items() if source != "-- Select --"}
     df = df.rename(columns=rename_dict)
     
-    # Filter to targets if mapped
+    # 2. Filter to Target Fields
     valid_targets = list(rename_dict.values())
     if valid_targets:
         cols = [c for c in valid_targets if c in df.columns]
         df = df[cols]
 
+    # 3. Apply Value Mapping (Robust)
     for col, rules in value_maps.items():
         if col in df.columns:
-            for r in rules: df[col] = df[col].replace(r['old'], r['new'])
+            # Ensure column is string to allow robust replacement of codes/values
+            df[col] = df[col].astype(str)
+            for r in rules:
+                df[col] = df[col].replace(r['old'], r['new'])
 
     return df, config.get('target_fields', [])
 
@@ -145,18 +149,19 @@ def generate_python_rule(description, columns, provider, api_key):
         "\n3. Handle None/NaN: use `.isna()` or `.notna()`."
         "\n4. If checking strings, use `.str.contains(...)` or `.str.len()`."
         "\n5. Date checks: ensure column is converted if needed or assume ISO format strings."
-        "\nExample Output: `(df['Age'] > 18) & (df['Status'] == 'Active')`"
+        "\n6. **CRITICAL:** Do NOT wrap the entire expression in quotes."
+        "\nExample Output: (df['Age'] > 18) & (df['Status'] == 'Active')"
     )
     prompt = f"DataFrame Columns: {columns}\nRequirement: {description}\n\nBoolean Expression:"
     
     if not api_key:
         col = columns[0] if columns else 'Col'
-        return f"# Demo Mode\n(df['{col}'].notna())"
+        return f"(df['{col}'].notna())"
         
     code = query_llm(provider, api_key, prompt, system_prompt)
-    # Strip markdown and quotes that might break execution
-    cleaned = re.sub(r'```python|```', '', code).strip()
-    return cleaned.strip("'").strip('"')
+    # Robust cleanup to prevent syntax error <string>
+    cleaned = re.sub(r'```python|```', '', code).strip().strip("'").strip('"')
+    return cleaned
 
 # --- AUTH ---
 if 'authenticated' not in st.session_state:
@@ -486,9 +491,8 @@ def main_app():
                             else: st.error("Error: Must return Boolean Series.")
                         except Exception as e: st.error(f"Error: {e}")
 
-                if c_save.button("💾 Save Rule", type="primary"):
-                    save_rule_callback(proj_id, dom, tbl)
-                    st.rerun()
+                # Using on_click callback to safely save and reset state
+                c_save.button("💾 Save Rule", type="primary", on_click=save_rule_callback, args=(proj_id, dom, tbl))
 
         with col_lib:
             st.subheader("Existing Rules")
@@ -523,13 +527,11 @@ def main_app():
         sel_k = st.selectbox("Dataset", [f"{r['domain']} - {r['table_name']}" for _, r in t_df.iterrows()])
         
         # --- FIXED GRID REFRESH ---
-        # If selection changed, force reload of dataframe
         if 'current_steward_table' not in st.session_state or st.session_state['current_steward_table'] != sel_k:
             dom, tbl = sel_k.split(" - ")
             path = t_df[t_df['table_name'] == tbl]['file_path'].values[0]
             st.session_state['steward_df'], _ = get_mapped_dataframe(proj_id, dom, tbl, path)
             st.session_state['current_steward_table'] = sel_k
-            # Optional rerun to ensure state is clean, but usually immediate assignment works
             st.rerun()
 
         dom, tbl = sel_k.split(" - ")
