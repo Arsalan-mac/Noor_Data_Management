@@ -182,46 +182,19 @@ def login_page():
                 else: st.error("Invalid credentials.")
         st.info("Demo: admin@company.com / admin")
 
-# --- CALLBACKS (CRITICAL FOR STATE SAFETY) ---
-def save_rule_callback(proj_id, sel_domain, sel_table):
-    r_name = st.session_state.get('input_rname', '')
-    r_desc = st.session_state.get('input_rdesc', '')
-    final_code = st.session_state.get('txt_code_area', '')
-    
-    if r_name and final_code:
-        conn = get_db_connection()
-        current_id = st.session_state.get('edit_rule_id')
-        if current_id:
-            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
-                            (r_name, r_desc, final_code, current_id))
-            st.toast("Rule Updated!")
-        else:
-            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
-                            (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
-            st.toast("Rule Created!")
-        conn.commit()
-        conn.close()
-        
-        # Reset State safely
-        st.session_state['edit_rule_id'] = None
-        st.session_state['edit_name'] = ""
-        st.session_state['edit_desc'] = ""
-        st.session_state['edit_code'] = ""
-        st.session_state['txt_code_area'] = ""
-
-def load_rule_callback(r_id, r_name, r_desc, r_code):
+# --- CALLBACKS & HELPERS ---
+def load_rule_for_edit(r_id, r_name, r_desc, r_code):
     st.session_state['edit_rule_id'] = r_id
     st.session_state['edit_name'] = r_name
     st.session_state['edit_desc'] = r_desc
     st.session_state['edit_code'] = r_code
     st.session_state['txt_code_area'] = r_code
 
-def delete_rule_callback(r_id):
+def delete_rule_db(r_id):
     conn = get_db_connection()
     conn.execute("DELETE FROM dq_rules WHERE id=?", (r_id,))
     conn.commit()
     conn.close()
-    st.toast("Rule Deleted!")
     if st.session_state.get('edit_rule_id') == r_id:
         st.session_state['edit_rule_id'] = None
         st.session_state['edit_name'] = ""
@@ -240,12 +213,15 @@ def main_app():
         if st.session_state['active_project']: st.success(f"📂 Active: {st.session_state['active_project']['name']}")
         else: st.warning("⚠️ No Project Selected")
         
-        menu_items = ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "BP Deduplication", "DQ Rules Config", "Data Stewardship", "Data Exploration"]
-        icons = ['speedometer2', 'gear', 'cloud-upload', 'git', 'people', 'tools', 'shield-check', 'compass']
+        # RENAMED & REMOVED ITEMS
+        menu_items = ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "DQ Rules Config", "Data Cleansing", "Smart A.I."]
+        icons = ['speedometer2', 'gear', 'cloud-upload', 'git', 'tools', 'shield-check', 'compass']
+        
         selected_view = option_menu("Navigation", menu_items, icons=icons, menu_icon="cast", default_index=0, styles={"container": {"padding": "0!important", "background-color": "#0f172a"},"nav-link": {"font-size": "14px", "text-align": "left", "--hover-color": "#1e293b"},"nav-link-selected": {"background-color": "#1e293b", "border-left": "4px solid #2563eb"}}) if HAS_OPTION_MENU else st.radio("Navigation", menu_items)
+        
         if st.button("Logout"): st.session_state['authenticated'] = False; st.rerun()
 
-    # 1. DASHBOARD (Full Drill Down)
+    # 1. DASHBOARD
     if selected_view == "Dashboard":
         st.title("Data Governance Dashboard")
         if not st.session_state['active_project']: st.info("Please select an Active Project."); return
@@ -282,242 +258,134 @@ def main_app():
             rule_grp['Health %'] = ((rule_grp['pass_count'] / rule_grp['Total']) * 100).round(1)
             st.dataframe(rule_grp.style.background_gradient(subset=['Health %'], cmap='RdYlGn', vmin=0, vmax=100), use_container_width=True)
         else:
-            st.info("No DQ Analysis runs found. Go to 'Data Stewardship' to execute rules.")
+            st.info("No DQ Analysis runs found. Go to 'Data Cleansing' to execute rules.")
 
-    # 2. PROJECT SETUP (Full)
+    # 2. PROJECT SETUP
     elif selected_view == "Project Setup":
         st.title("Project Configuration")
         tab1, tab2 = st.tabs(["Projects List", "Create New Project"])
-        
         with tab1:
             conn = get_db_connection()
             projects_df = pd.read_sql_query("SELECT * FROM projects", conn)
             conn.close()
-            
             if not projects_df.empty:
-                for index, row in projects_df.iterrows():
-                    col1, col2, col3, col4 = st.columns([1, 2, 2, 1])
-                    col1.write(f"**ID: {row['id']}**")
-                    col2.write(f"**{row['name']}**")
-                    col3.caption(f"{row['type']} | {row['llm_provider']}")
-                    if col4.button("Select", key=f"sel_proj_{row['id']}"):
-                        st.session_state['active_project'] = row.to_dict()
-                        st.session_state['api_key'] = "" 
-                        st.rerun()
-                
+                for _, row in projects_df.iterrows():
+                    c1, c2, c3, c4 = st.columns([1, 2, 2, 1])
+                    c1.write(f"**ID: {row['id']}**"); c2.write(f"**{row['name']}**"); c3.caption(f"{row['type']} | {row['llm_provider']}")
+                    if c4.button("Select", key=f"sel_proj_{row['id']}"):
+                        st.session_state['active_project'] = row.to_dict(); st.session_state['api_key'] = ""; st.rerun()
                 if st.session_state['active_project']:
-                    st.divider()
-                    st.success(f"Currently Active: {st.session_state['active_project']['name']}")
-                    st.caption("Re-enter API Key for this session")
-                    st.session_state['api_key'] = st.text_input("API Key", type="password")
-            else:
-                st.info("No projects found.")
-
+                    st.divider(); st.success(f"Active: {st.session_state['active_project']['name']}")
+                    st.session_state['api_key'] = st.text_input("API Key (Session)", type="password")
+            else: st.info("No projects found.")
         with tab2:
-            st.subheader("Create New Project")
-            col1, col2 = st.columns(2)
-            p_name = col1.text_input("Project Name")
-            p_type = col2.selectbox("Usecase", ["Clean Existing Data", "Migration Cleanse"])
-            domains = st.multiselect("Data Domains", ["Material", "Customer", "Supplier", "Finance", "HR"])
-            col3, col4 = st.columns(2)
-            llm_prov = col3.selectbox("LLM Provider", ["OpenAI (ChatGPT)", "Gemini"])
-            
-            if st.button("Create Project"):
-                if p_name:
-                    conn = get_db_connection()
-                    conn.execute("INSERT INTO projects (name, type, domains, llm_provider) VALUES (?, ?, ?, ?)",
-                                 (p_name, p_type, ",".join(domains), llm_prov))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Project '{p_name}' created!")
+            st.subheader("Create Project")
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Name"); p_type = c2.selectbox("Type", ["Clean Data", "Migration"])
+            domains = st.multiselect("Domains", ["Material", "Customer", "Supplier", "Finance", "HR"])
+            prov = st.selectbox("LLM", ["OpenAI (ChatGPT)", "Gemini"])
+            if st.button("Create"):
+                conn = get_db_connection()
+                conn.execute("INSERT INTO projects (name, type, domains, llm_provider) VALUES (?, ?, ?, ?)", (name, p_type, ",".join(domains), prov))
+                conn.commit(); conn.close(); st.success("Created!")
 
-    # 3. DATA INGESTION (Full)
+    # 3. DATA INGESTION
     elif selected_view == "Data Ingestion":
         st.title("Data Ingestion")
-        if not st.session_state['active_project']:
-            st.error("Select Active Project")
-            return
-
+        if not st.session_state['active_project']: st.error("Select Project"); return
         proj_id = st.session_state['active_project']['id']
-        domains = st.session_state['active_project']['domains'].split(',')
-
-        col1, col2 = st.columns(2)
-        domain = col1.selectbox("Domain", domains)
-        table_name = col2.text_input("Table Name (e.g., MARA)")
-        uploaded_file = st.file_uploader("Upload Data", type=['csv', 'xlsx'])
+        c1, c2 = st.columns(2)
+        domain = c1.selectbox("Domain", st.session_state['active_project']['domains'].split(','))
+        table = c2.text_input("Table Name (e.g., MARA)")
+        up_file = st.file_uploader("Upload Data", type=['csv', 'xlsx'])
+        if st.button("Ingest") and up_file and table:
+            conn = get_db_connection()
+            exist = conn.execute("SELECT id FROM data_log WHERE project_id=? AND domain=? AND table_name=?", (proj_id, domain, table)).fetchone()
+            conn.close()
+            f_path = os.path.join(DATA_STORAGE_DIR, f"{proj_id}_{domain}_{table}_{up_file.name}")
+            with open(f_path, "wb") as f: f.write(up_file.getbuffer())
+            df = pd.read_csv(f_path) if up_file.name.endswith('.csv') else pd.read_excel(f_path)
+            conn = get_db_connection()
+            if exist: conn.execute("UPDATE data_log SET file_path=?, row_count=? WHERE id=?", (f_path, len(df), exist[0]))
+            else: conn.execute("INSERT INTO data_log (project_id, domain, table_name, file_path, row_count) VALUES (?, ?, ?, ?, ?)", (proj_id, domain, table, f_path, len(df)))
+            conn.commit(); conn.close(); st.success("Data Updated!"); st.rerun()
         
-        if st.button("Ingest Data"):
-            if uploaded_file and table_name:
-                conn = get_db_connection()
-                existing = conn.execute("SELECT id, file_path FROM data_log WHERE project_id=? AND domain=? AND table_name=?", 
-                                      (proj_id, domain, table_name)).fetchone()
-                conn.close()
-                file_path = os.path.join(DATA_STORAGE_DIR, f"{proj_id}_{domain}_{table_name}_{uploaded_file.name}")
-                if existing:
-                    with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
-                    if uploaded_file.name.endswith('.csv'): df = pd.read_csv(file_path)
-                    else: df = pd.read_excel(file_path)
-                    conn = get_db_connection()
-                    conn.execute("UPDATE data_log SET file_path=?, row_count=? WHERE id=?", (file_path, len(df), existing[0]))
-                    conn.commit()
-                    conn.close()
-                    st.success("Data Updated!")
-                else:
-                    with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
-                    if uploaded_file.name.endswith('.csv'): df = pd.read_csv(file_path)
-                    else: df = pd.read_excel(file_path)
-                    conn = get_db_connection()
-                    conn.execute("INSERT INTO data_log (project_id, domain, table_name, file_path, row_count) VALUES (?, ?, ?, ?, ?)",
-                                 (proj_id, domain, table_name, file_path, len(df)))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Ingested {len(df)} rows.")
-
-        st.subheader("Ingested Data Tables")
+        st.subheader("Ingested Data")
         conn = get_db_connection()
         logs = pd.read_sql_query("SELECT * FROM data_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
-        if not logs.empty:
-            for i, row in logs.iterrows():
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                c1.write(f"**{row['domain']}**")
-                c2.write(row['table_name'])
-                c3.write(f"{row['row_count']} Rows")
-                if c4.button("Delete", key=f"del_{row['id']}"):
-                    conn = get_db_connection()
-                    conn.execute("DELETE FROM data_log WHERE id=?", (row['id'],))
-                    conn.commit()
-                    conn.close()
-                    if os.path.exists(row['file_path']): os.remove(row['file_path'])
-                    st.rerun()
+        for _, r in logs.iterrows():
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+            c1.write(f"**{r['domain']}**"); c2.write(r['table_name']); c3.write(f"{r['row_count']} Rows")
+            if c4.button("Del", key=f"d_{r['id']}"):
+                conn=get_db_connection(); conn.execute("DELETE FROM data_log WHERE id=?", (r['id'],)); conn.commit(); conn.close()
+                if os.path.exists(r['file_path']): os.remove(r['file_path'])
+                st.rerun()
 
-    # 4. DATA MAPPING (Full)
+    # 4. DATA MAPPING
     elif selected_view == "Data Mapping":
         st.title("Data Mapping Workbench")
-        if not st.session_state['active_project']:
-            st.error("Select Active Project")
-            return
-            
+        if not st.session_state['active_project']: st.error("Select Project"); return
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
         tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
+        if tables.empty: st.warning("No Data Ingested"); return
         
-        if tables.empty:
-            st.warning("Ingest data first to start mapping.")
-        else:
-            table_opts = [f"{r['domain']} - {r['table_name']}" for i, r in tables.iterrows()]
-            sel_table_str = st.selectbox("Select Table to Map", table_opts)
-            sel_domain, sel_table = sel_table_str.split(" - ")
-            
-            # Load Source Columns
-            file_path = tables[tables['table_name'] == sel_table]['file_path'].values[0]
-            if os.path.exists(file_path):
-                if file_path.endswith('.csv'): src_df = pd.read_csv(file_path, nrows=5)
-                else: src_df = pd.read_excel(file_path, nrows=5)
-                source_cols = ["-- Select --"] + src_df.columns.tolist()
-            else:
-                source_cols = ["File Missing"]
+        t_opt = [f"{r['domain']} - {r['table_name']}" for _, r in tables.iterrows()]
+        sel = st.selectbox("Select Table", t_opt)
+        dom, tbl = sel.split(" - ")
+        path = tables[tables['table_name'] == tbl]['file_path'].values[0]
+        
+        try: src_df = pd.read_csv(path, nrows=5) if path.endswith('.csv') else pd.read_excel(path, nrows=5)
+        except: src_df = pd.DataFrame()
+        src_cols = ["-- Select --"] + src_df.columns.tolist()
 
-            # Load Saved Config
-            conn = get_db_connection()
-            saved_config = conn.execute("SELECT config_json FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", 
-                                      (proj_id, sel_domain, sel_table)).fetchone()
-            conn.close()
-            
-            config = json.loads(saved_config[0]) if saved_config else {"target_fields": [], "mappings": {}, "value_maps": {}}
-            
-            # 1. Define Template
-            st.subheader("1. Target Template Definition")
-            with st.expander("Manage Target Fields", expanded=True):
-                c1, c2 = st.columns([3, 1])
-                new_field_input = c1.text_input("Add Target Field(s) (comma-separated)", placeholder="Material_ID, Description, Plant")
-                if c2.button("Add Field(s)"):
-                    if new_field_input:
-                        new_fields = [f.strip() for f in new_field_input.split(',') if f.strip()]
-                        added_count = 0
-                        for nf in new_fields:
-                            if nf not in config['target_fields']:
-                                config['target_fields'].append(nf)
-                                added_count += 1
-                        
-                        if added_count > 0:
-                            conn = get_db_connection()
-                            conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
-                            conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", 
-                                         (proj_id, sel_domain, sel_table, json.dumps(config)))
-                            conn.commit()
-                            conn.close()
-                            st.success(f"Added {added_count} fields!")
-                            st.rerun()
-                
-                st.write("Current Target Fields:", ", ".join(config['target_fields']))
+        conn = get_db_connection()
+        saved = conn.execute("SELECT config_json FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, dom, tbl)).fetchone()
+        conn.close()
+        config = json.loads(saved[0]) if saved else {"target_fields": [], "mappings": {}, "value_maps": {}}
 
-            # 2. Field Mapping
-            st.subheader("2. Field Mapping & Value Logic")
-            updated_mappings = config.get('mappings', {})
-            updated_value_maps = config.get('value_maps', {})
-            
-            for t_field in config['target_fields']:
-                with st.container():
-                    col1, col2, col3 = st.columns([2, 2, 2])
-                    col1.markdown(f"**{t_field}**")
-                    curr_val = updated_mappings.get(t_field, "-- Select --")
-                    idx = source_cols.index(curr_val) if curr_val in source_cols else 0
-                    selected_source = col2.selectbox(f"Source for {t_field}", source_cols, index=idx, key=f"src_{t_field}")
-                    updated_mappings[t_field] = selected_source
-                    
-                    if col3.button(f"Value Logic ({len(updated_value_maps.get(t_field, []))})", key=f"logic_{t_field}"):
-                        st.session_state['active_mapping_field'] = t_field
-
-            if st.button("Save Configuration"):
-                config['mappings'] = updated_mappings
+        st.subheader("1. Target Fields")
+        c1, c2 = st.columns([3, 1])
+        new_f = c1.text_input("Add Fields (comma-separated)", placeholder="ID, Name, Status")
+        if c2.button("Add"):
+            added = 0
+            for f in new_f.split(','):
+                f = f.strip()
+                if f and f not in config['target_fields']: config['target_fields'].append(f); added+=1
+            if added:
                 conn = get_db_connection()
-                conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
-                conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", 
-                             (proj_id, sel_domain, sel_table, json.dumps(config)))
-                conn.commit()
-                conn.close()
-                st.success("Configuration Saved!")
+                conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, dom, tbl))
+                conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, dom, tbl, json.dumps(config)))
+                conn.commit(); conn.close(); st.success(f"Added {added} fields"); st.rerun()
+        
+        st.subheader("2. Mappings")
+        for tf in config['target_fields']:
+            c1, c2, c3 = st.columns([2, 2, 2])
+            c1.markdown(f"**{tf}**")
+            cur = config['mappings'].get(tf, "-- Select --")
+            idx = src_cols.index(cur) if cur in src_cols else 0
+            config['mappings'][tf] = c2.selectbox(f"Source for {tf}", src_cols, index=idx, key=f"s_{tf}")
+            if c3.button("Values", key=f"v_{tf}"): st.session_state['active_mapping_field'] = tf
 
-            # 3. Value Mapping Modal
-            if 'active_mapping_field' in st.session_state:
-                field = st.session_state['active_mapping_field']
-                st.markdown("---")
-                st.info(f"Defining Value Mapping for: **{field}**")
-                vm_list = updated_value_maps.get(field, [])
-                c1, c2, c3 = st.columns([2, 2, 1])
-                src_val = c1.text_input("Old Value", key="vm_old")
-                tgt_val = c2.text_input("New Value", key="vm_new")
-                if c3.button("Add Rule"):
-                    if src_val and tgt_val:
-                        vm_list.append({"old": src_val, "new": tgt_val})
-                        updated_value_maps[field] = vm_list
-                        config['value_maps'] = updated_value_maps
-                        st.rerun()
-                for i, vm in enumerate(vm_list):
-                    st.write(f"{i+1}. '{vm['old']}' ➔ '{vm['new']}'")
-                if st.button("Close Logic Editor"):
-                    del st.session_state['active_mapping_field']
-                    st.rerun()
+        if st.button("Save Config"):
+            conn = get_db_connection()
+            conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, dom, tbl))
+            conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, dom, tbl, json.dumps(config)))
+            conn.commit(); conn.close(); st.success("Saved!")
 
-    # 5. BP DEDUPLICATION
-    elif selected_view == "BP Deduplication":
-        st.title("BP Deduplication")
-        uploaded_file = st.file_uploader("Upload Data (CSV or Excel)", type=['csv', 'xlsx'])
-        if uploaded_file:
-            if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
-            else: df = pd.read_excel(uploaded_file)
-            st.write("Preview:", df.head())
-            if st.button("Start Process"):
-                 with st.spinner("Processing..."):
-                     time.sleep(2)
-                     if not HAS_DEDUPE:
-                        st.warning("Pandas-Dedupe library missing. Simulating results.")
-                     st.success("Mock Deduplication Complete")
-                     st.dataframe(pd.DataFrame({'Name': ['Mock A', 'Mock A'], 'Score': [0.95, 0.95]}))
+        if 'active_mapping_field' in st.session_state:
+            f = st.session_state['active_mapping_field']
+            st.info(f"Value Mapping: {f}")
+            c1, c2, c3 = st.columns([2, 2, 1])
+            o = c1.text_input("Old"); n = c2.text_input("New")
+            if c3.button("Add Rule") and o and n:
+                l = config['value_maps'].get(f, []); l.append({"old": o, "new": n}); config['value_maps'][f] = l; st.rerun()
+            for vm in config['value_maps'].get(f, []): st.write(f"{vm['old']} -> {vm['new']}")
+            if st.button("Close"): del st.session_state['active_mapping_field']; st.rerun()
 
-    # 6. DQ RULES CONFIGURATION (Enhanced)
+    # 5. DQ RULES CONFIGURATION
     elif selected_view == "DQ Rules Config":
         st.title("🛠️ DQ Rules Studio")
         if not st.session_state['active_project']: st.error("Select Project"); return
@@ -529,26 +397,20 @@ def main_app():
         
         if tables.empty: st.warning("Ingest data first."); return
         
-        # 1. Context Selection
         c_sel, c_view = st.columns([1, 3])
         with c_sel:
             sel_table_str = st.selectbox("Select Table", [f"{r['domain']} - {r['table_name']}" for _, r in tables.iterrows()])
             dom, tbl = sel_table_str.split(" - ")
             path = tables[tables['table_name'] == tbl]['file_path'].values[0]
         
-        # Load Mapped Data for Context
         sample_df, mapped_cols = get_mapped_dataframe(proj_id, dom, tbl, path)
-        if mapped_cols: cols = mapped_cols
-        elif not sample_df.empty: cols = sample_df.columns.tolist()
-        else: cols = []
+        cols = mapped_cols if mapped_cols else (sample_df.columns.tolist() if not sample_df.empty else [])
 
         with c_view:
             st.caption("Available Columns:")
             st.code(",  ".join(cols) if cols else "No columns found")
 
         st.divider()
-
-        # 2. Main Layout: Studio (Left) vs Library (Right)
         col_studio, col_lib = st.columns([1, 1])
 
         with col_studio:
@@ -563,34 +425,41 @@ def main_app():
                     st.rerun()
                 
                 code_input = st.text_area("Python Boolean Mask", value=st.session_state.get('txt_code_area', ''), height=120, key="txt_code_area_widget")
-                # Sync widget to state variable to allow saving
                 st.session_state['txt_code_area'] = code_input
 
-                # --- TEST FUNCTIONALITY ---
                 c_test, c_save = st.columns(2)
                 if c_test.button("🧪 Test Rule"):
-                    if not code_input:
-                        st.error("No code to test.")
+                    if not code_input: st.error("No code.")
                     else:
                         try:
-                            # Run on sample
-                            local_scope = {'df': sample_df.head(50), 'pd': pd, 'np': np} # Test on 50 rows
+                            local_scope = {'df': sample_df.head(50), 'pd': pd, 'np': np}
                             mask = eval(code_input, {"__builtins__": None}, local_scope)
-                            
                             if isinstance(mask, pd.Series) and mask.dtype == bool:
-                                p_count = mask.sum()
-                                f_count = len(mask) - p_count
-                                st.success("✅ Syntax Valid")
-                                st.info(f"Preview (50 rows): {p_count} Pass, {f_count} Fail")
-                            else:
-                                st.error(f"❌ Error: Code must return a Boolean Series. Got {type(mask)}")
-                        except Exception as e:
-                            st.error(f"❌ Execution Error: {e}")
+                                st.success(f"✅ Valid. Pass: {mask.sum()}, Fail: {len(mask)-mask.sum()}")
+                            else: st.error("Error: Must return Boolean Series.")
+                        except Exception as e: st.error(f"Error: {e}")
 
+                # --- FIXED SAVE LOGIC ---
                 if c_save.button("💾 Save Rule", type="primary"):
-                    # Use Callback logic inline or call function if safe
-                    save_rule_callback(proj_id, dom, tbl)
-                    st.rerun()
+                    r_code = st.session_state.get('txt_code_area', '')
+                    if r_name and r_code:
+                        conn = get_db_connection()
+                        eid = st.session_state.get('edit_rule_id')
+                        if eid:
+                            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", (r_name, r_desc, r_code, eid))
+                            st.toast("Rule Updated!")
+                        else:
+                            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)", (proj_id, dom, tbl, r_name, r_desc, r_code))
+                            st.toast("Rule Created!")
+                        conn.commit(); conn.close()
+                        # Reset
+                        st.session_state['edit_rule_id'] = None
+                        st.session_state['edit_name'] = ""
+                        st.session_state['edit_desc'] = ""
+                        st.session_state['txt_code_area'] = ""
+                        st.rerun() # Force Reload
+                    else:
+                        st.error("Name and Code required.")
 
         with col_lib:
             st.subheader("Existing Rules")
@@ -603,21 +472,18 @@ def main_app():
                     with st.expander(f"**{row['rule_name']}**", expanded=False):
                         st.caption(row['rule_description'])
                         st.code(row['python_code'], language='python')
-                        
                         c_edit, c_del = st.columns([1, 1])
                         if c_edit.button("Edit", key=f"ed_{row['id']}"):
-                            load_rule_callback(row['id'], row['rule_name'], row['rule_description'], row['python_code'])
+                            load_rule_for_edit(row['id'], row['rule_name'], row['rule_description'], row['python_code'])
                             st.rerun()
-                        
                         if c_del.button("Delete", key=f"del_{row['id']}"):
-                            delete_rule_callback(row['id'])
+                            delete_rule_db(row['id'])
                             st.rerun()
-            else:
-                st.info("No rules defined for this table yet.")
+            else: st.info("No rules defined.")
 
-    # 7. STEWARDSHIP (Full)
-    elif selected_view == "Data Stewardship":
-        st.title("Data Stewardship")
+    # 6. DATA CLEANSING (Renamed from Stewardship)
+    elif selected_view == "Data Cleansing":
+        st.title("Data Cleansing & Stewardship")
         if not st.session_state['active_project']: st.error("Select Project"); return
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
@@ -636,8 +502,6 @@ def main_app():
             df = st.session_state['steward_df'].copy()
             conn = get_db_connection()
             rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, dom, tbl))
-            
-            # Reset logs for this run
             conn.execute("DELETE FROM dq_results_log WHERE project_id=? AND domain=? AND table_name=?", (proj_id, dom, tbl))
             
             for _, r in rules.iterrows():
@@ -646,7 +510,6 @@ def main_app():
                     if isinstance(mask, pd.Series):
                         df[f"{r['rule_name']}_Status"] = mask.map({True: "Valid", False: "Invalid"})
                         df[f"{r['rule_name']}_Justification"] = mask.map({True: "Passed", False: r['rule_description']})
-                        
                         conn.execute("INSERT INTO dq_results_log (project_id, domain, table_name, rule_name, pass_count, fail_count) VALUES (?, ?, ?, ?, ?, ?)",
                                      (proj_id, dom, tbl, r['rule_name'], int(mask.sum()), int(len(mask)-mask.sum())))
                 except Exception as e: st.error(f"Rule {r['rule_name']} failed: {e}")
@@ -657,13 +520,11 @@ def main_app():
 
         st.data_editor(st.session_state['steward_df'], num_rows="dynamic", use_container_width=True, key="main_editor")
         if st.button("Save to Disk"):
-            # Save logic...
             st.success("Saved!")
 
-    # 8. DATA EXPLORATION (Full Chat)
-    elif selected_view == "Data Exploration":
-        st.title("AI Data Explorer")
-        # Chat implementation
+    # 7. SMART A.I. (Renamed from Data Exploration)
+    elif selected_view == "Smart A.I.":
+        st.title("Smart A.I. Explorer")
         if not st.session_state['active_project']: st.error("Select Project"); return
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
@@ -695,8 +556,32 @@ def main_app():
                 provider = st.session_state['active_project']['llm_provider']
                 
                 resp = query_llm(provider, api_key, user_input, sys_prompt)
-                st.markdown(resp)
-                st.session_state["chat_history"].append({"role": "assistant", "content": resp})
+                
+                code_match = re.search(r'```python(.*?)```', resp, re.DOTALL)
+                final_resp = resp
+                
+                if code_match:
+                    code = code_match.group(1).strip()
+                    try:
+                        f = io.StringIO()
+                        with redirect_stdout(f):
+                            local_scope = {'df': df, 'pd': pd, 'np': np}
+                            exec(code, {}, local_scope)
+                        output = f.getvalue()
+                        new_df = local_scope.get('df')
+                        if new_df is not None and not new_df.equals(df):
+                            st.session_state['chat_df'] = new_df
+                            final_resp += "\n\n✅ **Data Modified**"
+                        if output: final_resp += f"\n\n**Output:**\n```\n{output}\n```"
+                    except Exception as e: final_resp += f"\n\n❌ Error: {e}"
+                
+                st.markdown(final_resp)
+                st.session_state["chat_history"].append({"role": "assistant", "content": final_resp})
+
+        if st.button("Save Chat Changes to Disk"):
+            if path.endswith('.csv'): st.session_state['chat_df'].to_csv(path, index=False)
+            else: st.session_state['chat_df'].to_excel(path, index=False)
+            st.success("Changes Saved!")
 
 # --- RUN ---
 init_db()
