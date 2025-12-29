@@ -9,6 +9,7 @@ import json
 import re
 import sys
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta
 
 # --- SAFE IMPORTS ---
 try:
@@ -77,7 +78,14 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS data_log (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, file_path TEXT, row_count INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS dq_rules (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, rule_name TEXT, rule_description TEXT, python_code TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS mapping_config (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, config_json TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS dq_results_log (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, rule_name TEXT, pass_count INTEGER, fail_count INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Updated: Added 'is_latest' column to handle history vs current state
+    try:
+        c.execute('''ALTER TABLE dq_results_log ADD COLUMN is_latest BOOLEAN DEFAULT 1''')
+    except:
+        pass # Column likely exists or table not created yet
+        
+    c.execute('''CREATE TABLE IF NOT EXISTS dq_results_log (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, rule_name TEXT, pass_count INTEGER, fail_count INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, is_latest BOOLEAN DEFAULT 1)''')
     
     # Seeds
     c.execute("SELECT * FROM users WHERE email='admin@company.com'")
@@ -103,11 +111,11 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     mappings = config.get('mappings', {})
     value_maps = config.get('value_maps', {})
 
-    # 1. Rename Columns (Source -> Target)
+    # 1. Rename Columns
     rename_dict = {source: target for target, source in mappings.items() if source != "-- Select --"}
     df = df.rename(columns=rename_dict)
     
-    # 2. Filter to Target Fields (keep only mapped columns)
+    # 2. Filter to Target Fields
     valid_targets = list(rename_dict.values())
     if valid_targets:
         cols = [c for c in valid_targets if c in df.columns]
@@ -116,7 +124,6 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
     # 3. Apply Value Mapping (Robust)
     for col, rules in value_maps.items():
         if col in df.columns:
-            # Ensure column is string to allow robust replacement of codes/values
             df[col] = df[col].astype(str)
             for r in rules:
                 df[col] = df[col].replace(r['old'], r['new'])
@@ -282,7 +289,11 @@ def main_app():
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
         t_df = pd.read_sql_query("SELECT domain, table_name, row_count FROM data_log WHERE project_id=?", conn, params=(proj_id,))
-        r_df = pd.read_sql_query("SELECT * FROM dq_results_log WHERE project_id=?", conn, params=(proj_id,))
+        # Fetch only 'is_latest=1' for current status visuals
+        r_df_latest = pd.read_sql_query("SELECT * FROM dq_results_log WHERE project_id=? AND is_latest=1", conn, params=(proj_id,))
+        # Fetch ALL for trend
+        r_df_all = pd.read_sql_query("SELECT * FROM dq_results_log WHERE project_id=?", conn, params=(proj_id,))
+        
         rc = conn.execute("SELECT COUNT(*) FROM dq_rules WHERE project_id=?", (proj_id,)).fetchone()[0]
         conn.close()
 
@@ -295,18 +306,48 @@ def main_app():
         if domains: st.info(f"**Applicable Domains:** {', '.join(domains)}")
 
         st.markdown("### 📊 Data Quality Health")
-        if not r_df.empty:
-            sel_dom = st.selectbox("Drill Down Domain", ["All"] + domains)
-            f_res = r_df if sel_dom == "All" else r_df[r_df['domain'] == sel_dom]
+        
+        # --- MULTI-DOMAIN PIE CHARTS (Current State) ---
+        if not r_df_latest.empty:
+            tot_p = r_df_latest['pass_count'].sum(); tot_f = r_df_latest['fail_count'].sum()
+            overall_dq = int((tot_p / (tot_p + tot_f)) * 100) if (tot_p + tot_f) > 0 else 0
             
-            tot_p = f_res['pass_count'].sum(); tot_f = f_res['fail_count'].sum()
-            if HAS_PLOTLY and (tot_p+tot_f) > 0:
-                fig = go.Figure(data=[go.Pie(labels=['Valid', 'Invalid'], values=[tot_p, tot_f], hole=.6, marker_colors=['#22c55e', '#ef4444'])])
-                fig.update_layout(title=f"DQ Score ({sel_dom})", height=300, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white")
-                st.plotly_chart(fig, use_container_width=True)
+            c_chart1, c_chart2 = st.columns([1, 2])
+            with c_chart1:
+                if HAS_PLOTLY:
+                    fig = go.Figure(data=[go.Pie(labels=['Valid', 'Invalid'], values=[tot_p, tot_f], hole=.6, marker_colors=['#22c55e', '#ef4444'])])
+                    fig.update_layout(title=f"Overall DQ Score: {overall_dq}%", height=300, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
             
+            if len(domains) > 0:
+                cols = st.columns(len(domains))
+                for idx, d in enumerate(domains):
+                    d_df = r_df_latest[r_df_latest['domain'] == d]
+                    d_p = d_df['pass_count'].sum(); d_f = d_df['fail_count'].sum()
+                    d_score = int((d_p / (d_p + d_f)) * 100) if (d_p + d_f) > 0 else 0
+                    
+                    if HAS_PLOTLY and (d_p + d_f) > 0:
+                        fig_d = go.Figure(data=[go.Pie(labels=['Valid', 'Invalid'], values=[d_p, d_f], hole=.7, marker_colors=['#22c55e', '#ef4444'])])
+                        fig_d.update_layout(title=f"{d}: {d_score}%", height=200, margin=dict(t=30, b=0, l=0, r=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", showlegend=False)
+                        cols[idx].plotly_chart(fig_d, use_container_width=True)
+
+            st.divider()
+            
+            # --- TREND LINE (Historical Data) ---
+            st.subheader("Data Quality Trend (Errors over Time)")
+            if HAS_PLOTLY and not r_df_all.empty:
+                # Convert timestamp to date for grouping
+                r_df_all['date'] = pd.to_datetime(r_df_all['timestamp']).dt.date
+                trend_data = r_df_all.groupby('date')[['fail_count']].sum().reset_index()
+                
+                fig_line = px.line(trend_data, x='date', y='fail_count', title="Total Errors Detected Daily", markers=True)
+                fig_line.update_traces(line_color='#ef4444')
+                fig_line.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", xaxis_title="Date", yaxis_title="Error Count")
+                st.plotly_chart(fig_line, use_container_width=True)
+
+            # Breakdown Table
             st.markdown("#### Rule Performance Breakdown")
-            rule_grp = f_res.groupby(['table_name', 'rule_name'])[['pass_count', 'fail_count']].sum().reset_index()
+            rule_grp = r_df_latest.groupby(['domain', 'table_name', 'rule_name'])[['pass_count', 'fail_count']].sum().reset_index()
             rule_grp['Total'] = rule_grp['pass_count'] + rule_grp['fail_count']
             rule_grp['Health %'] = ((rule_grp['pass_count'] / rule_grp['Total']) * 100).round(1)
             st.dataframe(rule_grp.style.background_gradient(subset=['Health %'], cmap='RdYlGn', vmin=0, vmax=100), use_container_width=True)
@@ -457,6 +498,13 @@ def main_app():
                     conn.commit(); conn.close(); st.success("Rule Added!"); st.rerun()
             
             if f in config['value_maps']:
+                if st.button("Delete All Rules for this field"):
+                    config['value_maps'][f] = []
+                    conn = get_db_connection()
+                    conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
+                    conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
+                    conn.commit(); conn.close(); st.rerun()
+
                 for idx, vm in enumerate(config['value_maps'][f]):
                     cols = st.columns([4, 1])
                     cols[0].write(f"{idx+1}. '{vm['old']}' ➔ '{vm['new']}'")
@@ -580,7 +628,9 @@ def main_app():
             df = st.session_state['steward_df'].copy()
             conn = get_db_connection()
             rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
-            conn.execute("DELETE FROM dq_results_log WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
+            
+            # --- HISTORY LOGIC: Mark previous as not latest, Insert new as latest ---
+            conn.execute("UPDATE dq_results_log SET is_latest=0 WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
             
             for _, r in rules.iterrows():
                 try:
@@ -588,7 +638,7 @@ def main_app():
                     if isinstance(mask, pd.Series):
                         df[f"{r['rule_name']}_Status"] = mask.map({True: "✅ Valid", False: "❌ Invalid"})
                         df[f"{r['rule_name']}_Justification"] = mask.map({True: "Passed", False: r['rule_description']})
-                        conn.execute("INSERT INTO dq_results_log (project_id, domain, table_name, rule_name, pass_count, fail_count) VALUES (?, ?, ?, ?, ?, ?)",
+                        conn.execute("INSERT INTO dq_results_log (project_id, domain, table_name, rule_name, pass_count, fail_count, is_latest) VALUES (?, ?, ?, ?, ?, ?, 1)",
                                      (proj_id, sel_domain, sel_table, r['rule_name'], int(mask.sum()), int(len(mask)-mask.sum())))
                 except: pass
             
@@ -603,7 +653,6 @@ def main_app():
         view_df = main_df.copy()
         
         if show_errors:
-            # Filter if any status column contains "Invalid"
             status_cols = [c for c in view_df.columns if c.endswith('_Status')]
             if status_cols:
                 mask = view_df[status_cols].apply(lambda x: x.str.contains('Invalid', na=False)).any(axis=1)
@@ -612,15 +661,15 @@ def main_app():
         # EDITABLE GRID WITH AUTO-RERUN LOGIC
         edited_view_df = st.data_editor(view_df, num_rows="dynamic", use_container_width=True, key="main_editor")
         
-        # PROPAGATE EDITS BACK TO MAIN DF
+        # PROPAGATE EDITS BACK TO MAIN DF & RE-RUN RULES
         if not edited_view_df.equals(view_df):
-            # Update main_df with changes from filtered view
             main_df.update(edited_view_df)
             
-            # Auto Re-run rules on ALL data (Vectorized is fast)
             conn = get_db_connection()
             rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
-            conn.close()
+            
+            # --- HISTORY LOGIC ON EDIT: Same as Run Button ---
+            conn.execute("UPDATE dq_results_log SET is_latest=0 WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
             
             for _, r in rules.iterrows():
                 try:
@@ -628,8 +677,11 @@ def main_app():
                     if isinstance(mask, pd.Series):
                         main_df[f"{r['rule_name']}_Status"] = mask.map({True: "✅ Valid", False: "❌ Invalid"})
                         main_df[f"{r['rule_name']}_Justification"] = mask.map({True: "Passed", False: r['rule_description']})
+                        conn.execute("INSERT INTO dq_results_log (project_id, domain, table_name, rule_name, pass_count, fail_count, is_latest) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                                     (proj_id, sel_domain, sel_table, r['rule_name'], int(mask.sum()), int(len(mask)-mask.sum())))
                 except: pass
             
+            conn.commit(); conn.close()
             st.session_state['steward_df'] = main_df
             st.rerun()
 
@@ -641,7 +693,7 @@ def main_app():
         towrite = io.BytesIO()
         st.session_state['steward_df'].to_excel(towrite, index=False, header=True)
         towrite.seek(0)
-        c_dl.download_button("Download Excel", towrite, f"clean_{sel_table}.xlsx")
+        c_dl.download_button("Download Excel", towrite, f"clean_{sel_table}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # 7. SMART A.I.
     elif selected_view == "Smart A.I.":
