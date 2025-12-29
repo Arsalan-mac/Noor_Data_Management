@@ -196,14 +196,20 @@ def save_rule_callback(proj_id, sel_domain, sel_table):
     
     if r_name and final_code:
         conn = get_db_connection()
-        # Always insert as new because "Edit" deletes the old one
-        conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
-                        (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
-        st.toast("Rule Saved!")
+        current_id = st.session_state.get('edit_rule_id')
+        if current_id:
+            conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
+                            (r_name, r_desc, final_code, current_id))
+            st.toast("Rule Updated!")
+        else:
+            conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
+                            (proj_id, sel_domain, sel_table, r_name, r_desc, final_code))
+            st.toast("Rule Created!")
         conn.commit()
         conn.close()
         
-        # Reset State safely
+        # Reset State
+        st.session_state['edit_rule_id'] = None
         st.session_state['edit_name'] = ""
         st.session_state['edit_desc'] = ""
         st.session_state['edit_code'] = ""
@@ -212,19 +218,25 @@ def save_rule_callback(proj_id, sel_domain, sel_table):
         st.session_state['input_rname'] = ""
         st.session_state['input_rdesc'] = ""
 
-def load_rule_and_delete(r_id, r_name, r_desc, r_code):
-    # 1. Load into Session State for Editor
+def load_rule_for_edit(r_id, r_name, r_desc, r_code):
+    st.session_state['edit_rule_id'] = r_id
     st.session_state['edit_name'] = r_name
     st.session_state['edit_desc'] = r_desc
     st.session_state['edit_code'] = r_code
     st.session_state['txt_code_area'] = r_code
-    
-    # Update WIDGET keys to force UI refresh on rerun
+    st.session_state['input_rname'] = r_name
+    st.session_state['input_rdesc'] = r_desc
+    st.session_state['txt_code_area_widget'] = r_code
+
+def load_rule_and_delete(r_id, r_name, r_desc, r_code):
+    st.session_state['edit_name'] = r_name
+    st.session_state['edit_desc'] = r_desc
+    st.session_state['edit_code'] = r_code
+    st.session_state['txt_code_area'] = r_code
     st.session_state['input_rname'] = r_name
     st.session_state['input_rdesc'] = r_desc
     st.session_state['txt_code_area_widget'] = r_code
     
-    # 2. Delete from DB (User must save again to persist)
     conn = get_db_connection()
     conn.execute("DELETE FROM dq_rules WHERE id=?", (r_id,))
     conn.commit()
@@ -237,11 +249,19 @@ def delete_rule_db(r_id):
     conn.commit()
     conn.close()
     st.toast("Rule Deleted!")
+    if st.session_state.get('edit_rule_id') == r_id:
+        st.session_state['edit_rule_id'] = None
+        st.session_state['edit_name'] = ""
+        st.session_state['edit_desc'] = ""
+        st.session_state['edit_code'] = ""
+        st.session_state['txt_code_area'] = ""
+        st.session_state['txt_code_area_widget'] = ""
+        st.session_state['input_rname'] = ""
+        st.session_state['input_rdesc'] = ""
 
 # --- MAIN APP ---
 def main_app():
-    # GLOBAL STATE INIT
-    for k in ['edit_name', 'edit_desc', 'edit_code', 'txt_code_area', 'txt_code_area_widget', 'active_mapping_field']:
+    for k in ['edit_name', 'edit_desc', 'edit_code', 'txt_code_area', 'txt_code_area_widget', 'active_mapping_field', 'steward_df_cache_key']:
         if k not in st.session_state: st.session_state[k] = ""
 
     with st.sidebar:
@@ -320,7 +340,10 @@ def main_app():
             if st.button("Create"):
                 conn = get_db_connection()
                 conn.execute("INSERT INTO projects (name, type, domains, llm_provider) VALUES (?, ?, ?, ?)", (name, p_type, ",".join(domains), prov))
-                conn.commit(); conn.close(); st.success("Created!"); st.rerun() # Added Rerun
+                conn.commit(); conn.close()
+                st.success("Project Created Successfully!")
+                time.sleep(1) 
+                st.rerun()
 
     # 3. DATA INGESTION
     elif selected_view == "Data Ingestion":
@@ -361,16 +384,13 @@ def main_app():
         if not st.session_state['active_project']: st.error("Select Project"); return
         proj_id = st.session_state['active_project']['id']
         conn = get_db_connection()
-        # Fetch only what's needed
         t_df = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
         if t_df.empty: st.warning("No Data Ingested"); return
         
-        # --- TWO STEP DROPDOWN ---
         c_dom, c_tbl = st.columns(2)
         avail_domains = sorted(t_df['domain'].unique().tolist())
         sel_domain = c_dom.selectbox("Select Domain", avail_domains)
-        
         avail_tables = t_df[t_df['domain'] == sel_domain]['table_name'].unique().tolist()
         sel_table = c_tbl.selectbox("Select Table", avail_tables)
         
@@ -386,7 +406,7 @@ def main_app():
         config = json.loads(saved[0]) if saved else {"target_fields": [], "mappings": {}, "value_maps": {}}
 
         st.subheader("1. Target Fields")
-        c1, c2 = st.columns([3, 1])
+        c1, c2, c3 = st.columns([3, 1, 1])
         new_f = c1.text_input("Add Fields (comma-separated)", placeholder="ID, Name, Status")
         if c2.button("Add"):
             added = 0
@@ -398,6 +418,11 @@ def main_app():
                 conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
                 conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
                 conn.commit(); conn.close(); st.success(f"Added {added} fields"); st.rerun()
+        if c3.button("Auto-Map"):
+            for t_col in config['target_fields']:
+                if t_col in src_cols: config['mappings'][t_col] = t_col
+            st.toast("Auto-mapped matching columns")
+            st.rerun()
         
         st.subheader("2. Mappings")
         for tf in config['target_fields']:
@@ -425,29 +450,25 @@ def main_app():
             
             if c3.button("Add Rule"):
                 if o and n:
-                    # Update Config
-                    l = config['value_maps'].get(f, [])
-                    l.append({"old": o, "new": n})
-                    config['value_maps'][f] = l
-                    
-                    # Persist IMMEDIATELY to DB
+                    l = config['value_maps'].get(f, []); l.append({"old": o, "new": n}); config['value_maps'][f] = l
                     conn = get_db_connection()
                     conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
                     conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
-                    conn.commit(); conn.close()
-                    st.success("Rule Added!")
-                    st.rerun()
+                    conn.commit(); conn.close(); st.success("Rule Added!"); st.rerun()
             
-            # List existing rules
             if f in config['value_maps']:
                 for idx, vm in enumerate(config['value_maps'][f]):
-                    st.write(f"{idx+1}. '{vm['old']}' ➔ '{vm['new']}'")
-            else:
-                st.caption("No value mappings defined yet.")
+                    cols = st.columns([4, 1])
+                    cols[0].write(f"{idx+1}. '{vm['old']}' ➔ '{vm['new']}'")
+                    if cols[1].button("Del", key=f"vm_del_{idx}"):
+                        config['value_maps'][f].pop(idx)
+                        conn = get_db_connection()
+                        conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
+                        conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
+                        conn.commit(); conn.close(); st.rerun()
+            else: st.caption("No value mappings.")
 
-            if st.button("Close Editor"): 
-                del st.session_state['active_mapping_field']
-                st.rerun()
+            if st.button("Close Editor"): del st.session_state['active_mapping_field']; st.rerun()
 
     # 5. DQ RULES CONFIGURATION
     elif selected_view == "DQ Rules Config":
@@ -456,24 +477,24 @@ def main_app():
         proj_id = st.session_state['active_project']['id']
         
         conn = get_db_connection()
-        tables = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
+        t_df = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
         conn.close()
         
-        if tables.empty: st.warning("Ingest data first."); return
+        if t_df.empty: st.warning("Ingest data first."); return
         
-        c_sel, c_view = st.columns([1, 3])
-        with c_sel:
-            sel_table_str = st.selectbox("Select Table", [f"{r['domain']} - {r['table_name']}" for _, r in tables.iterrows()])
-            dom, tbl = sel_table_str.split(" - ")
-            path = tables[tables['table_name'] == tbl]['file_path'].values[0]
+        # Two-step dropdown
+        c_dom, c_tbl = st.columns(2)
+        avail_domains = sorted(t_df['domain'].unique().tolist())
+        sel_domain = c_dom.selectbox("Select Domain", avail_domains)
+        avail_tables = t_df[t_df['domain'] == sel_domain]['table_name'].unique().tolist()
+        sel_table = c_tbl.selectbox("Select Table", avail_tables)
         
-        sample_df, mapped_cols = get_mapped_dataframe(proj_id, dom, tbl, path)
+        path = t_df[(t_df['domain'] == sel_domain) & (t_df['table_name'] == sel_table)]['file_path'].values[0]
+        
+        sample_df, mapped_cols = get_mapped_dataframe(proj_id, sel_domain, sel_table, path)
         cols = mapped_cols if mapped_cols else (sample_df.columns.tolist() if not sample_df.empty else [])
 
-        with c_view:
-            st.caption("Available Columns:")
-            st.code(",  ".join(cols) if cols else "No columns found")
-
+        st.caption("Available Columns: " + ", ".join(cols) if cols else "No columns found")
         st.divider()
         col_studio, col_lib = st.columns([1, 1])
 
@@ -504,13 +525,12 @@ def main_app():
                             else: st.error("Error: Must return Boolean Series.")
                         except Exception as e: st.error(f"Error: {e}")
 
-                # Save Rule (Always creates new, assumes edit deleted old)
-                c_save.button("💾 Save Rule", type="primary", on_click=save_rule_callback, args=(proj_id, dom, tbl))
+                c_save.button("💾 Save Rule", type="primary", on_click=save_rule_callback, args=(proj_id, sel_domain, sel_table))
 
         with col_lib:
             st.subheader("Existing Rules")
             conn = get_db_connection()
-            rules = pd.read_sql_query("SELECT id, rule_name, rule_description, python_code FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, dom, tbl))
+            rules = pd.read_sql_query("SELECT id, rule_name, rule_description, python_code FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
             conn.close()
             
             if not rules.empty:
@@ -519,7 +539,6 @@ def main_app():
                         st.caption(row['rule_description'])
                         st.code(row['python_code'], language='python')
                         c_edit, c_del = st.columns([1, 1])
-                        # EDIT: Load into editor AND delete from DB
                         if c_edit.button("Edit", key=f"ed_{row['id']}"):
                             load_rule_and_delete(row['id'], row['rule_name'], row['rule_description'], row['python_code'])
                             st.rerun()
@@ -538,40 +557,91 @@ def main_app():
         conn.close()
         
         if t_df.empty: return
-        sel_k = st.selectbox("Dataset", [f"{r['domain']} - {r['table_name']}" for _, r in t_df.iterrows()])
         
-        if 'current_steward_table' not in st.session_state or st.session_state['current_steward_table'] != sel_k:
-            dom, tbl = sel_k.split(" - ")
-            path = t_df[t_df['table_name'] == tbl]['file_path'].values[0]
-            st.session_state['steward_df'], _ = get_mapped_dataframe(proj_id, dom, tbl, path)
-            st.session_state['current_steward_table'] = sel_k
+        # Two-step dropdown
+        c_dom, c_tbl = st.columns(2)
+        avail_domains = sorted(t_df['domain'].unique().tolist())
+        sel_domain = c_dom.selectbox("Select Domain", avail_domains)
+        avail_tables = t_df[t_df['domain'] == sel_domain]['table_name'].unique().tolist()
+        sel_table = c_tbl.selectbox("Select Table", avail_tables)
+        
+        # Cache Key for Reload
+        current_selection_key = f"{sel_domain}_{sel_table}"
+        
+        if 'steward_df_cache_key' not in st.session_state or st.session_state['steward_df_cache_key'] != current_selection_key:
+            path = t_df[(t_df['domain'] == sel_domain) & (t_df['table_name'] == sel_table)]['file_path'].values[0]
+            st.session_state['steward_df'], _ = get_mapped_dataframe(proj_id, sel_domain, sel_table, path)
+            st.session_state['steward_df_cache_key'] = current_selection_key
             st.rerun()
 
-        dom, tbl = sel_k.split(" - ")
-
-        if st.button("RUN DQ ANALYSIS ⚡", type="primary"):
+        # RUN ANALYSIS BUTTON
+        c_run, c_filter = st.columns([2, 1])
+        if c_run.button("RUN DQ ANALYSIS ⚡", type="primary"):
             df = st.session_state['steward_df'].copy()
             conn = get_db_connection()
-            rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, dom, tbl))
-            conn.execute("DELETE FROM dq_results_log WHERE project_id=? AND domain=? AND table_name=?", (proj_id, dom, tbl))
+            rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
+            conn.execute("DELETE FROM dq_results_log WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
             
             for _, r in rules.iterrows():
                 try:
                     mask = eval(r['python_code'], {"__builtins__": None}, {'df': df, 'pd': pd, 'np': np})
                     if isinstance(mask, pd.Series):
-                        df[f"{r['rule_name']}_Status"] = mask.map({True: "Valid", False: "Invalid"})
+                        df[f"{r['rule_name']}_Status"] = mask.map({True: "✅ Valid", False: "❌ Invalid"})
                         df[f"{r['rule_name']}_Justification"] = mask.map({True: "Passed", False: r['rule_description']})
                         conn.execute("INSERT INTO dq_results_log (project_id, domain, table_name, rule_name, pass_count, fail_count) VALUES (?, ?, ?, ?, ?, ?)",
-                                     (proj_id, dom, tbl, r['rule_name'], int(mask.sum()), int(len(mask)-mask.sum())))
-                except Exception as e: st.error(f"Rule {r['rule_name']} failed: {e}")
+                                     (proj_id, sel_domain, sel_table, r['rule_name'], int(mask.sum()), int(len(mask)-mask.sum())))
+                except: pass
             
             conn.commit(); conn.close()
             st.session_state['steward_df'] = df
             st.success("Analysis Complete")
 
-        st.data_editor(st.session_state['steward_df'], num_rows="dynamic", use_container_width=True, key="main_editor")
-        if st.button("Save to Disk"):
+        show_errors = c_filter.checkbox("Show Rows with Errors Only")
+
+        # FILTER LOGIC
+        main_df = st.session_state['steward_df']
+        view_df = main_df.copy()
+        
+        if show_errors:
+            # Filter if any status column contains "Invalid"
+            status_cols = [c for c in view_df.columns if c.endswith('_Status')]
+            if status_cols:
+                mask = view_df[status_cols].apply(lambda x: x.str.contains('Invalid', na=False)).any(axis=1)
+                view_df = view_df[mask]
+
+        # EDITABLE GRID WITH AUTO-RERUN LOGIC
+        edited_view_df = st.data_editor(view_df, num_rows="dynamic", use_container_width=True, key="main_editor")
+        
+        # PROPAGATE EDITS BACK TO MAIN DF
+        if not edited_view_df.equals(view_df):
+            # Update main_df with changes from filtered view
+            main_df.update(edited_view_df)
+            
+            # Auto Re-run rules on ALL data (Vectorized is fast)
+            conn = get_db_connection()
+            rules = pd.read_sql_query("SELECT * FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
+            conn.close()
+            
+            for _, r in rules.iterrows():
+                try:
+                    mask = eval(r['python_code'], {"__builtins__": None}, {'df': main_df, 'pd': pd, 'np': np})
+                    if isinstance(mask, pd.Series):
+                        main_df[f"{r['rule_name']}_Status"] = mask.map({True: "✅ Valid", False: "❌ Invalid"})
+                        main_df[f"{r['rule_name']}_Justification"] = mask.map({True: "Passed", False: r['rule_description']})
+                except: pass
+            
+            st.session_state['steward_df'] = main_df
+            st.rerun()
+
+        c_save, c_dl = st.columns(2)
+        if c_save.button("Save to Disk"):
             st.success("Saved!")
+        
+        # Download Button
+        towrite = io.BytesIO()
+        st.session_state['steward_df'].to_excel(towrite, index=False, header=True)
+        towrite.seek(0)
+        c_dl.download_button("Download Excel", towrite, f"clean_{sel_table}.xlsx")
 
     # 7. SMART A.I.
     elif selected_view == "Smart A.I.":
