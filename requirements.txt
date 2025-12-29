@@ -10,3 +10,4 @@ sqlalchemy
 openpyxl
 plotly
 matplotlib
+fuzzywuzzy
