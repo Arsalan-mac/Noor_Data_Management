@@ -8,7 +8,9 @@ import time
 import json
 import re
 import sys
-import requests # Added for VIES SOAP Calls
+import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 
@@ -45,8 +47,15 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
+try:
+    from fuzzywuzzy import fuzz
+    HAS_FUZZY = True
+except ImportError:
+    HAS_FUZZY = False
+
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Noor Data Governance", page_icon="🛡️", layout="wide", initial_sidebar_state="expanded")
+GOOGLE_API_KEY = 'AIzaSyA7RYsUT4L9OsETxCvTBjBlyoNnnmJOK88' 
 
 # --- CUSTOM CSS ---
 def load_css():
@@ -124,67 +133,92 @@ def get_mapped_dataframe(proj_id, domain, table_name, file_path):
 
     return df, config.get('target_fields', [])
 
-# --- EXTERNAL VALIDATION SIMULATORS & REAL VIES ---
-def validate_address_mock(address):
-    # Simulate Google Maps API Check
-    if pd.isna(address) or str(address).strip() == "": return "❌ Missing"
-    addr_str = str(address).lower()
-    if len(addr_str) < 5: return "⚠️ Too Short"
-    if any(x in addr_str for x in ['road', 'street', 'ave', 'lane', 'str', 'way']): return "✅ Valid"
-    return "⚠️ Review"
+# --- EXTERNAL VALIDATION LOGIC ---
 
-def validate_vat_soap(vat):
-    """
-    Real VIES VAT Validation via SOAP.
-    Endpoint: http://ec.europa.eu/taxation_customs/vies/services/checkVatService
-    """
-    if pd.isna(vat) or str(vat).strip() == "": return "❌ Missing"
+def validate_vat_soap_single(row, vat_col):
+    """Real VIES VAT Validation via SOAP - Single Item"""
+    vat = row.get(vat_col)
+    idx = row.name
     
-    # 1. Clean Input
+    if pd.isna(vat) or str(vat).strip() == "": 
+        return {'index': idx, 'status': "❌ Missing"}
+    
     full_vat = str(vat).upper().replace(" ", "").replace(".", "").replace("-", "")
+    if not re.match(r'^[A-Z]{2}[0-9A-Z]+$', full_vat): 
+        return {'index': idx, 'status': "❌ Invalid Format"}
     
-    # Basic format check (2 char Country + Code)
-    if not re.match(r'^[A-Z]{2}[0-9A-Z]+$', full_vat):
-        return "❌ Invalid Format"
-        
     country_code = full_vat[:2]
     vat_number = full_vat[2:]
     
-    # 2. Construct SOAP XML
     url = "http://ec.europa.eu/taxation_customs/vies/services/checkVatService"
     headers = {'Content-Type': 'text/xml; charset=utf-8'}
-    body = f"""
-    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
-       <soapenv:Header/>
-       <soapenv:Body>
-          <urn:checkVat>
-             <urn:countryCode>{country_code}</urn:countryCode>
-             <urn:vatNumber>{vat_number}</urn:vatNumber>
-          </urn:checkVat>
-       </soapenv:Body>
-    </soapenv:Envelope>
-    """
+    body = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types"><soapenv:Header/><soapenv:Body><urn:checkVat><urn:countryCode>{country_code}</urn:countryCode><urn:vatNumber>{vat_number}</urn:vatNumber></urn:checkVat></soapenv:Body></soapenv:Envelope>"""
     
     try:
-        # 3. Send Request
         response = requests.post(url, headers=headers, data=body, timeout=5)
-        
         if response.status_code == 200:
-            # 4. Parse Response (Simple String Check is faster/safer than ElementTree for boolean)
-            # VIES returns <valid>true</valid> or <valid>false</valid>
-            if "<valid>true</valid>" in response.text:
-                return "✅ Valid (VIES)"
-            elif "<valid>false</valid>" in response.text:
-                return "❌ Invalid (VIES)"
-            else:
-                return "⚠️ VIES Unknown"
-        else:
-            return f"⚠️ API Error {response.status_code}"
-            
-    except requests.exceptions.Timeout:
-        return "⚠️ Timeout"
-    except Exception as e:
-        return "⚠️ Connection Error"
+            if "<valid>true</valid>" in response.text: return {'index': idx, 'status': "✅ Valid (VIES)"}
+            elif "<valid>false</valid>" in response.text: return {'index': idx, 'status': "❌ Invalid (VIES)"}
+            else: return {'index': idx, 'status': "⚠️ VIES Unknown"}
+        else: return {'index': idx, 'status': f"⚠️ API Error {response.status_code}"}
+    except: return {'index': idx, 'status': "⚠️ Connection Error"}
+
+def search_place_google(row, col_mapping):
+    """Calls Google Places API to validate address composed of multiple columns"""
+    parts = []
+    if col_mapping.get('Name') and pd.notna(row.get(col_mapping['Name'])): parts.append(str(row[col_mapping['Name']]))
+    
+    addr_parts = []
+    for k in ['Street', 'HouseNum', 'PostCode', 'City', 'Country']:
+        if col_mapping.get(k) and pd.notna(row.get(col_mapping[k])):
+            addr_parts.append(str(row[col_mapping[k]]))
+        
+    query_addr = " ".join(addr_parts)
+    if query_addr: parts.append(query_addr)
+    full_query = ", ".join(parts)
+    
+    if not full_query.strip():
+        return {'index': row.name, 'MatchedName': '', 'MatchedAddress': '', 'PlaceID': '', 'Confidence': 0.0, 'Status': '❌ Empty Input'}
+
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {'query': full_query, 'key': GOOGLE_API_KEY}
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'OK' and data.get('results'):
+                result = data['results'][0]
+                return {
+                    'index': row.name,
+                    'MatchedName': result.get('name', ''),
+                    'MatchedAddress': result.get('formatted_address', ''),
+                    'PlaceID': result.get('place_id', ''),
+                    'Confidence': result.get('rating', 0.0), 
+                    'Status': '✅ Found'
+                }
+        return {'index': row.name, 'MatchedName': '', 'MatchedAddress': '', 'PlaceID': '', 'Confidence': 0.0, 'Status': '❌ Not Found'}
+    except Exception:
+        return {'index': row.name, 'MatchedName': '', 'MatchedAddress': '', 'PlaceID': '', 'Confidence': 0.0, 'Status': '⚠️ Error'}
+
+def validate_fuzzy(row, col_mapping):
+    if row.get('Google_Status') != '✅ Found': return "N/A"
+    if not HAS_FUZZY: return "Lib Missing"
+    
+    input_name = str(row.get(col_mapping['Name'], '')).strip().lower()
+    found_name = str(row.get('Google_Name', '')).strip().lower()
+    
+    if not input_name: return "No Input Name"
+
+    scores = [
+        fuzz.ratio(input_name, found_name),
+        fuzz.partial_ratio(input_name, found_name),
+        fuzz.token_sort_ratio(input_name, found_name),
+        fuzz.token_set_ratio(input_name, found_name)
+    ]
+    
+    if any(s >= 70 for s in scores): return "✅ Confident Match"
+    return "⚠️ Potential Mismatch"
 
 # --- AI HELPER ---
 def query_llm(provider, api_key, prompt, system_prompt="You are a helpful data assistant."):
@@ -361,7 +395,6 @@ def main_app():
             tot_p = r_df['pass_count'].sum(); tot_f = r_df['fail_count'].sum()
             overall_dq = int((tot_p / (tot_p + tot_f)) * 100) if (tot_p + tot_f) > 0 else 0
             
-            # 1. Main Overall Pie (Centered)
             c_fill1, c_main, c_fill2 = st.columns([1, 2, 1])
             with c_main:
                 if HAS_PLOTLY:
@@ -369,7 +402,6 @@ def main_app():
                     fig.update_layout(title=dict(text=f"Overall DQ Score: {overall_dq}%", x=0.5, font=dict(size=20)), height=350, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                     st.plotly_chart(fig, use_container_width=True)
 
-            # 2. Domain Donuts
             if len(domains) > 0:
                 st.markdown("#### Domain Breakdown")
                 cols = st.columns(max(len(domains), 1))
@@ -385,7 +417,6 @@ def main_app():
                     else:
                         cols[idx].warning(f"{d}: No DQ Data")
 
-            # 3. Rule Table
             st.markdown("#### Rule Performance Breakdown")
             rule_grp = r_df.groupby(['domain', 'table_name', 'rule_name'])[['pass_count', 'fail_count']].sum().reset_index()
             rule_grp['Total'] = rule_grp['pass_count'] + rule_grp['fail_count']
@@ -394,7 +425,6 @@ def main_app():
             
             st.divider()
             
-            # 4. Trend Line
             st.subheader("Data Quality Trend (Errors over Time)")
             if HAS_PLOTLY and not r_df_all.empty:
                 r_df_all['date'] = pd.to_datetime(r_df_all['timestamp']).dt.date
@@ -588,6 +618,7 @@ def main_app():
         
         if t_df.empty: st.warning("Ingest data first."); return
         
+        # Two-step dropdown
         c_dom, c_tbl = st.columns(2)
         avail_domains = sorted(t_df['domain'].unique().tolist())
         sel_domain = c_dom.selectbox("Select Domain", avail_domains)
@@ -663,12 +694,14 @@ def main_app():
         
         if t_df.empty: return
         
+        # Two-step dropdown
         c_dom, c_tbl = st.columns(2)
         avail_domains = sorted(t_df['domain'].unique().tolist())
         sel_domain = c_dom.selectbox("Select Domain", avail_domains)
         avail_tables = t_df[t_df['domain'] == sel_domain]['table_name'].unique().tolist()
         sel_table = c_tbl.selectbox("Select Table", avail_tables)
         
+        # Cache Key for Reload
         current_selection_key = f"{sel_domain}_{sel_table}"
         
         if 'steward_df_cache_key' not in st.session_state or st.session_state['steward_df_cache_key'] != current_selection_key:
@@ -704,25 +737,69 @@ def main_app():
                 st.session_state['steward_df'] = df
                 st.success("Analysis Complete")
 
-        # 2. External Validation (Real SOAP)
+        # 2. External Validation (Real SOAP + Google Logic)
         if sel_domain in ["Customer", "Supplier"]:
             with st.expander("🌍 External Validation (Google Maps & VIES SOAP)"):
-                st.info("Validate addresses (Mock) and VAT numbers (Real VIES).")
-                ec1, ec2 = st.columns(2)
-                cols = st.session_state['steward_df'].columns.tolist()
-                addr_col = ec1.selectbox("Address Column", ["-- Select --"] + cols)
-                vat_col = ec2.selectbox("VAT Column", ["-- Select --"] + cols)
+                st.info("Validate addresses (Google) and VAT numbers (VIES). Select columns to construct address query.")
                 
-                if st.button("Run External Checks"):
-                    df = st.session_state['steward_df'].copy()
-                    with st.spinner("Calling External APIs..."):
-                        if addr_col != "-- Select --":
-                            df['Ext_Address_Check'] = df[addr_col].apply(validate_address_mock)
-                        if vat_col != "-- Select --":
-                            df['Ext_VAT_Check'] = df[vat_col].apply(validate_vat_soap)
-                        st.session_state['steward_df'] = df
-                        st.success("External Validation Complete!")
-                        st.rerun()
+                cols = st.session_state['steward_df'].columns.tolist()
+                
+                col_c1, col_c2, col_c3 = st.columns(3)
+                cm_name = col_c1.selectbox("Name Column", [""] + cols)
+                cm_street = col_c2.selectbox("Street Column", [""] + cols)
+                cm_housenum = col_c3.selectbox("House Num Column", [""] + cols)
+                
+                col_c4, col_c5, col_c6 = st.columns(3)
+                cm_city = col_c4.selectbox("City Column", [""] + cols)
+                cm_post = col_c5.selectbox("PostCode Column", [""] + cols)
+                cm_country = col_c6.selectbox("Country Column", [""] + cols)
+                
+                st.markdown("---")
+                vat_col = st.selectbox("VAT Number Column (for VIES)", [""] + cols)
+                
+                c_btn1, c_btn2 = st.columns(2)
+                
+                if c_btn1.button("Check Address (Google Maps)", use_container_width=True):
+                    col_mapping = {'Name': cm_name, 'Street': cm_street, 'HouseNum': cm_housenum, 'City': cm_city, 'PostCode': cm_post, 'Country': cm_country}
+                    if any(col_mapping.values()):
+                        df = st.session_state['steward_df'].copy()
+                        with st.spinner("Checking Addresses (Parallel Google API)..."):
+                            results_map = {}
+                            with ThreadPoolExecutor(max_workers=10) as executor:
+                                futures = {executor.submit(search_place_google, row, col_mapping): row.name for _, row in df.iterrows()}
+                                for future in as_completed(futures):
+                                    res = future.result()
+                                    results_map[res['index']] = res
+                            
+                            for idx, res in results_map.items():
+                                df.at[idx, 'Google_Name'] = res['MatchedName']
+                                df.at[idx, 'Google_Address'] = res['MatchedAddress']
+                                df.at[idx, 'Google_Status'] = res['Status']
+                                df.at[idx, 'Google_Conf'] = res['Confidence']
+                                if HAS_FUZZY: df.at[idx, 'Fuzzy_Match'] = validate_fuzzy(df.loc[idx], col_mapping)
+                            
+                            st.session_state['steward_df'] = df
+                            st.success("Address Validation Complete!")
+                            st.rerun()
+
+                if c_btn2.button("Check VAT (VIES SOAP)", use_container_width=True):
+                    if vat_col:
+                        df = st.session_state['steward_df'].copy()
+                        with st.spinner("Checking VAT Numbers (Parallel VIES SOAP)..."):
+                            results_map = {}
+                            # VIES can be slow, parallelize cautiously (e.g. 5 workers)
+                            with ThreadPoolExecutor(max_workers=5) as executor:
+                                futures = {executor.submit(validate_vat_soap_single, row, vat_col): row.name for _, row in df.iterrows()}
+                                for future in as_completed(futures):
+                                    res = future.result()
+                                    results_map[res['index']] = res
+                            
+                            for idx, res in results_map.items():
+                                df.at[idx, 'Ext_VAT_Check'] = res['status']
+                                
+                            st.session_state['steward_df'] = df
+                            st.success("VAT Validation Complete!")
+                            st.rerun()
 
         show_errors = c_filter.checkbox("Show Rows with Errors Only")
 
