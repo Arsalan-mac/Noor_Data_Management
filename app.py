@@ -146,38 +146,39 @@ def validate_vat_soap_single(row, vat_col):
     # Basic cleaning
     full_vat = str(vat).upper().replace(" ", "").replace(".", "").replace("-", "")
     
-    # Improved Regex for generic EU format: Start with 2 letters, followed by 2-12 alphanumeric characters
+    # Improved Regex for generic EU format
     if not re.match(r'^[A-Z]{2}[0-9A-Z]{2,12}$', full_vat):
         return {'index': idx, 'status': "❌ Invalid Format"}
     
     country_code = full_vat[:2]
     vat_number = full_vat[2:]
+
+    # EU Country Check
+    eu_countries = [
+        "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR", 
+        "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", 
+        "SE", "SI", "SK", "XI"
+    ]
+    if country_code not in eu_countries:
+        return {'index': idx, 'status': "⚠️ Non-EU (Skipped)"}
     
     url = "http://ec.europa.eu/taxation_customs/vies/services/checkVatService"
     headers = {'Content-Type': 'text/xml; charset=utf-8'}
     body = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types"><soapenv:Header/><soapenv:Body><urn:checkVat><urn:countryCode>{country_code}</urn:countryCode><urn:vatNumber>{vat_number}</urn:vatNumber></urn:checkVat></soapenv:Body></soapenv:Envelope>"""
     
     try:
-        response = requests.post(url, headers=headers, data=body, timeout=10) # Increased timeout
+        response = requests.post(url, headers=headers, data=body, timeout=10) 
         if response.status_code == 200:
-            # More robust XML parsing for 'valid' tag
-            # The response typically looks like: ...<valid>true</valid>... or ...<valid>false</valid>...
-            # We look for the tag and check its content.
-            
-            # Simple check first
             if "<valid>true</valid>" in response.text or "<ns2:valid>true</ns2:valid>" in response.text:
                  return {'index': idx, 'status': "✅ Valid (VIES)"}
             elif "<valid>false</valid>" in response.text or "<ns2:valid>false</ns2:valid>" in response.text:
                  return {'index': idx, 'status': "❌ Invalid (VIES)"}
             
-            # If simple check fails, maybe namespaces are different, try a broader regex search
-            # Search for <...:valid>true</...:valid> or <valid>true</valid>
             if re.search(r"<([a-zA-Z0-9]+:)?valid>true</\1?valid>", response.text):
                 return {'index': idx, 'status': "✅ Valid (VIES)"}
             elif re.search(r"<([a-zA-Z0-9]+:)?valid>false</\1?valid>", response.text):
                 return {'index': idx, 'status': "❌ Invalid (VIES)"}
             else:
-                # If we get a 200 but can't find valid tag, it might be a Fault or unexpected structure
                 if "Fault" in response.text:
                      return {'index': idx, 'status': "⚠️ VIES Fault"}
                 return {'index': idx, 'status': "⚠️ VIES Unknown Response"}
