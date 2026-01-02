@@ -1208,4 +1208,39 @@ def main_app():
 
             with st.chat_message("assistant"):
                 df = st.session_state['chat_df']
-                sys_prompt = f"Data
+                sys_prompt = f"Data Analyst. Columns: {df.columns.tolist()}. Generate Python code in ```python blocks to answer."
+                api_key = st.session_state.get('api_key')
+                provider = st.session_state['active_project']['llm_provider']
+                
+                resp = query_llm(provider, api_key, user_input, sys_prompt)
+                
+                code_match = re.search(r'```python(.*?)```', resp, re.DOTALL)
+                final_resp = resp
+                
+                if code_match:
+                    code = code_match.group(1).strip()
+                    try:
+                        f = io.StringIO()
+                        with redirect_stdout(f):
+                            local_scope = {'df': df, 'pd': pd, 'np': np}
+                            exec(code, {}, local_scope)
+                        output = f.getvalue()
+                        new_df = local_scope.get('df')
+                        if new_df is not None and not new_df.equals(df):
+                            st.session_state['chat_df'] = new_df
+                            final_resp += "\n\n✅ **Data Modified**"
+                        if output: final_resp += f"\n\n**Output:**\n```\n{output}\n```"
+                    except Exception as e: final_resp += f"\n\n❌ Error: {e}"
+                
+                st.markdown(final_resp)
+                st.session_state["chat_history"].append({"role": "assistant", "content": final_resp})
+
+        if st.button("Save Chat Changes to Disk"):
+            if path.endswith('.csv'): st.session_state['chat_df'].to_csv(path, index=False)
+            else: st.session_state['chat_df'].to_excel(path, index=False)
+            st.success("Changes Saved!")
+
+# --- RUN ---
+init_db()
+if not st.session_state['authenticated']: login_page()
+else: main_app()
