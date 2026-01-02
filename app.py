@@ -194,12 +194,16 @@ def validate_vat_soap_single(row, vat_col):
 def search_place_google(row, col_mapping):
     """Calls Google Places API to validate address composed of multiple columns"""
     parts = []
-    if col_mapping.get('Name') and pd.notna(row.get(col_mapping['Name'])): parts.append(str(row[col_mapping['Name']]))
+    # Name
+    if col_mapping.get('Name') and pd.notna(row.get(col_mapping['Name'])): 
+        parts.append(str(row[col_mapping['Name']]))
     
+    # Address Components (from Multiselect)
+    addr_cols = col_mapping.get('AddressCols', [])
     addr_parts = []
-    for k in ['Street', 'HouseNum', 'PostCode', 'City', 'Country']:
-        if col_mapping.get(k) and pd.notna(row.get(col_mapping[k])):
-            addr_parts.append(str(row[col_mapping[k]]))
+    for col in addr_cols:
+        if pd.notna(row.get(col)):
+            addr_parts.append(str(row[col]))
         
     query_addr = " ".join(addr_parts)
     if query_addr: parts.append(query_addr)
@@ -772,15 +776,11 @@ def main_app():
                 
                 cols = st.session_state['steward_df'].columns.tolist()
                 
-                col_c1, col_c2, col_c3 = st.columns(3)
+                # --- UPDATED ADDRESS INPUT UI ---
+                # Replaced individual dropdowns with Multiselect for Address components
+                col_c1, col_c2 = st.columns(2)
                 cm_name = col_c1.selectbox("Name Column", [""] + cols)
-                cm_street = col_c2.selectbox("Street Column", [""] + cols)
-                cm_housenum = col_c3.selectbox("House Num Column", [""] + cols)
-                
-                col_c4, col_c5, col_c6 = st.columns(3)
-                cm_city = col_c4.selectbox("City Column", [""] + cols)
-                cm_post = col_c5.selectbox("PostCode Column", [""] + cols)
-                cm_country = col_c6.selectbox("Country Column", [""] + cols)
+                cm_addr_cols = col_c2.multiselect("Select Address Columns (Order matters: Street, City, Country...)", cols)
                 
                 st.markdown("---")
                 vat_col = st.selectbox("VAT Number Column (for VIES)", [""] + cols)
@@ -788,8 +788,10 @@ def main_app():
                 c_btn1, c_btn2 = st.columns(2)
                 
                 if c_btn1.button("Check Address (Google Maps)", use_container_width=True):
-                    col_mapping = {'Name': cm_name, 'Street': cm_street, 'HouseNum': cm_housenum, 'City': cm_city, 'PostCode': cm_post, 'Country': cm_country}
-                    if any(col_mapping.values()):
+                    # Updated Mapping for Search Function
+                    col_mapping = {'Name': cm_name, 'AddressCols': cm_addr_cols}
+                    
+                    if cm_name or cm_addr_cols:
                         df = st.session_state['steward_df'].copy()
                         with st.spinner("Checking Addresses (Parallel Google API)..."):
                             results_map = {}
@@ -866,7 +868,17 @@ def main_app():
 
         c_save, c_dl = st.columns(2)
         if c_save.button("Save to Disk"):
-            st.success("Saved!")
+            # --- UPDATED SAVE LOGIC ---
+            # Save the current state of stewardship (including edits and new columns) back to the source file
+            path = t_df[(t_df['domain'] == sel_domain) & (t_df['table_name'] == sel_table)]['file_path'].values[0]
+            try:
+                if path.endswith('.csv'):
+                    st.session_state['steward_df'].to_csv(path, index=False)
+                else:
+                    st.session_state['steward_df'].to_excel(path, index=False)
+                st.success(f"Saved changes to {os.path.basename(path)}!")
+            except Exception as e:
+                st.error(f"Error saving file: {e}")
         
         towrite = io.BytesIO()
         st.session_state['steward_df'].to_excel(towrite, index=False, header=True)
