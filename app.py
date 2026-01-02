@@ -381,6 +381,39 @@ def save_rule_callback(proj_id, sel_domain, sel_table):
         st.session_state['input_rname'] = ""
         st.session_state['input_rdesc'] = ""
 
+def auto_generate_rule_callback(proj_id, sel_domain, sel_table, cols, provider, api_key):
+    r_name = st.session_state.get('input_rname', '')
+    r_desc = st.session_state.get('input_rdesc', '')
+    
+    if not r_name or not r_desc:
+        # Cannot easily show UI error from callback, but state won't change so user sees form again
+        return
+
+    # 1. Generate Code
+    code = generate_python_rule(r_desc, cols, provider, api_key)
+    
+    # 2. Save directly to DB
+    conn = get_db_connection()
+    current_id = st.session_state.get('edit_rule_id')
+    if current_id:
+        conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
+                        (r_name, r_desc, code, current_id))
+        st.toast("Rule Updated & Saved!")
+    else:
+        conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
+                        (proj_id, sel_domain, sel_table, r_name, r_desc, code))
+        st.toast("Rule Created & Saved!")
+    conn.commit()
+    conn.close()
+
+    # 3. Clear Session State Logic
+    # Safely clear keys to reset the form. 
+    # Since this runs in the callback (before re-render), it avoids the "modified after instantiation" error.
+    keys_to_reset = ['edit_rule_id', 'edit_name', 'edit_desc', 'edit_code', 'txt_code_area', 'txt_code_area_widget', 'input_rname', 'input_rdesc']
+    for k in keys_to_reset:
+        if k in st.session_state:
+            del st.session_state[k]
+
 def load_rule_for_edit(r_id, r_name, r_desc, r_code):
     st.session_state['edit_rule_id'] = r_id
     st.session_state['edit_name'] = r_name
@@ -607,9 +640,10 @@ def main_app():
         config = json.loads(saved[0]) if saved else {"target_fields": [], "mappings": {}, "value_maps": {}}
 
         st.subheader("1. Target Fields")
-        c1, c2, c3 = st.columns([3, 1, 1])
-        new_f = c1.text_input("Add Fields (comma-separated)", placeholder="ID, Name, Status")
-        if c2.button("Add"):
+        
+        # CHANGED: Input takes full width (no st.columns), Button on next line
+        new_f = st.text_input("Add Fields (comma-separated)", placeholder="ID, Name, Status")
+        if st.button("Add Target Fields"):
             added = 0
             for f in new_f.split(','):
                 f = f.strip()
@@ -619,11 +653,8 @@ def main_app():
                 conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
                 conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
                 conn.commit(); conn.close(); st.success(f"Added {added} fields"); st.rerun()
-        if c3.button("Auto-Map"):
-            for t_col in config['target_fields']:
-                if t_col in src_cols: config['mappings'][t_col] = t_col
-            st.toast("Auto-mapped matching columns")
-            st.rerun()
+        
+        # REMOVED: Auto-Map button
         
         st.subheader("2. Mappings")
         for tf in config['target_fields']:
@@ -676,7 +707,8 @@ def main_app():
                         conn.commit(); conn.close(); st.rerun()
             else: st.caption("No value mappings.")
 
-            if st.button("Close Editor"): del st.session_state['active_mapping_field']; st.rerun()
+            # REMOVED: Close Editor button
+            # if st.button("Close Editor"): del st.session_state['active_mapping_field']; st.rerun()
 
     # --- NEW: DATA DICTIONARY ---
     elif selected_view == "Data Dictionary":
@@ -835,41 +867,10 @@ def main_app():
                 r_desc = st.text_area("Requirement (English)", value=st.session_state.get('edit_desc', ''), placeholder="e.g., Status must be 'Active'", key="input_rdesc")
                 
                 # AUTOMATED BUTTON: Generate, Save, and Rerun
-                if st.button("✨ Generate & Save Rule", type="primary"):
-                    if not r_name or not r_desc:
-                        st.error("Please provide both Rule Name and Requirement.")
-                    else:
-                        with st.spinner("Generating Python Logic & Saving..."):
-                            # 1. Generate Code
-                            code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
-                            
-                            # 2. Save directly to DB
-                            conn = get_db_connection()
-                            current_id = st.session_state.get('edit_rule_id')
-                            if current_id:
-                                conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
-                                                (r_name, r_desc, code, current_id))
-                                st.toast("Rule Updated & Saved!")
-                            else:
-                                conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
-                                                (proj_id, sel_domain, sel_table, r_name, r_desc, code))
-                                st.toast("Rule Created & Saved!")
-                            conn.commit()
-                            conn.close()
-
-                            # 3. Clear State
-                            st.session_state['edit_rule_id'] = None
-                            st.session_state['edit_name'] = ""
-                            st.session_state['edit_desc'] = ""
-                            st.session_state['edit_code'] = ""
-                            st.session_state['txt_code_area'] = ""
-                            st.session_state['txt_code_area_widget'] = ""
-                            st.session_state['input_rname'] = ""
-                            st.session_state['input_rdesc'] = ""
-                            
-                            # 4. Refresh List
-                            time.sleep(1)
-                            st.rerun()
+                # Using on_click callback to avoid "StreamlitAPIException: modification after instantiation"
+                st.button("✨ Generate & Save Rule", type="primary", 
+                          on_click=auto_generate_rule_callback,
+                          args=(proj_id, sel_domain, sel_table, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key')))
 
         with col_lib:
             st.subheader("Existing Rules")
