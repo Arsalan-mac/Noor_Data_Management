@@ -69,6 +69,7 @@ def load_css():
         div[data-testid="stSidebar"] { background-color: #020617; border-right: 1px solid #1e293b; }
         div[data-testid="stMetricValue"] { color: #f8fafc; }
         .stButton button { border-radius: 6px; font-weight: 600; }
+        hr { border-color: #334155; }
         </style>
     """, unsafe_allow_html=True)
     if os.path.exists("style.css"):
@@ -256,6 +257,52 @@ def search_place_google(row, col_mapping):
         return {'index': row.name, 'MatchedName': '', 'MatchedAddress': '', 'PlaceID': '', 'Confidence': 0.0, 'Status': '❌ Not Found'}
     except Exception:
         return {'index': row.name, 'MatchedName': '', 'MatchedAddress': '', 'PlaceID': '', 'Confidence': 0.0, 'Status': '⚠️ Error'}
+
+def fetch_google_place_details(place_id):
+    """Fetches details for parsing address components"""
+    if not place_id: return None
+    url = "https://maps.googleapis.com/maps/api/place/details/json"
+    params = {'place_id': place_id, 'fields': 'address_component', 'key': GOOGLE_API_KEY}
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            return response.json().get('result', {})
+        return None
+    except: return None
+
+def parse_address_components(row):
+    """Parses Google Address components into specific fields"""
+    pid = row.get('PlaceID')
+    idx = row.name
+    
+    if not pid: 
+        return {'index': idx, 'found': False}
+
+    details = fetch_google_place_details(pid)
+    if not details or 'address_components' not in details:
+        return {'index': idx, 'found': False}
+    
+    comps = details['address_components']
+    parsed = {
+        'index': idx,
+        'found': True,
+        'Extracted_House_Number': '',
+        'Extracted_Street': '',
+        'Extracted_City': '',
+        'Extracted_Postal_Code': '',
+        'Extracted_Country': ''
+    }
+    
+    for c in comps:
+        types = c.get('types', [])
+        if 'street_number' in types: parsed['Extracted_House_Number'] = c.get('long_name', '')
+        if 'route' in types: parsed['Extracted_Street'] = c.get('long_name', '')
+        if 'locality' in types: parsed['Extracted_City'] = c.get('long_name', '')
+        elif 'postal_town' in types and not parsed['Extracted_City']: parsed['Extracted_City'] = c.get('long_name', '')
+        if 'postal_code' in types: parsed['Extracted_Postal_Code'] = c.get('long_name', '')
+        if 'country' in types: parsed['Extracted_Country'] = c.get('long_name', '')
+
+    return parsed
 
 def validate_fuzzy(row, col_mapping):
     if row.get('Google_Status') != '✅ Found': return "N/A"
@@ -506,6 +553,8 @@ def main_app():
                     fig = go.Figure(data=[go.Pie(labels=['Valid', 'Invalid'], values=[tot_p, tot_f], hole=.5, marker_colors=['#22c55e', '#ef4444'])])
                     fig.update_layout(title=dict(text=f"Overall DQ Score: {overall_dq}%", x=0.5, font=dict(size=20)), height=350, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                     st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider() # ADDED DIVIDER
 
             if len(domains) > 0:
                 st.markdown("#### Domain Breakdown")
@@ -521,6 +570,8 @@ def main_app():
                             cols[idx].plotly_chart(fig_d, use_container_width=True)
                     else:
                         cols[idx].warning(f"{d}: No DQ Data")
+            
+            st.divider() # ADDED DIVIDER
 
             st.markdown("#### Rule Performance Breakdown")
             rule_grp = r_df.groupby(['domain', 'table_name', 'rule_name'])[['pass_count', 'fail_count']].sum().reset_index()
@@ -528,7 +579,7 @@ def main_app():
             rule_grp['Health %'] = ((rule_grp['pass_count'] / rule_grp['Total']) * 100).round(1)
             st.dataframe(rule_grp.style.background_gradient(subset=['Health %'], cmap='RdYlGn', vmin=0, vmax=100), use_container_width=True)
             
-            st.divider()
+            st.divider() # ADDED DIVIDER
             
             st.subheader("Data Quality Trend (Errors over Time)")
             if HAS_PLOTLY and not r_df_all.empty:
@@ -544,6 +595,9 @@ def main_app():
                 fig_line.update_traces(line_color='#ef4444', line_width=3)
                 fig_line.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", xaxis_title="Date", yaxis_title="Error Count", hovermode="x unified")
                 st.plotly_chart(fig_line, use_container_width=True)
+            
+            st.divider() # ADDED DIVIDER
+
         else:
             st.info("No DQ Analysis runs found. Go to 'Data Cleansing' to execute rules.")
 
@@ -654,16 +708,26 @@ def main_app():
                 conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
                 conn.commit(); conn.close(); st.success(f"Added {added} fields"); st.rerun()
         
-        # REMOVED: Auto-Map button
-        
         st.subheader("2. Mappings")
         for tf in config['target_fields']:
-            c1, c2, c3 = st.columns([2, 2, 2])
+            # CHANGED: Added delete column (c4)
+            c1, c2, c3, c4 = st.columns([2, 2, 1, 0.5])
             c1.markdown(f"**{tf}**")
             cur = config['mappings'].get(tf, "-- Select --")
             idx = src_cols.index(cur) if cur in src_cols else 0
             config['mappings'][tf] = c2.selectbox(f"Source for {tf}", src_cols, index=idx, key=f"s_{tf}")
             if c3.button("Values", key=f"v_{tf}"): st.session_state['active_mapping_field'] = tf
+            
+            # Delete Button
+            if c4.button("❌", key=f"del_map_{tf}", help="Remove field"):
+                config['target_fields'].remove(tf)
+                if tf in config['mappings']: del config['mappings'][tf]
+                # Save changes
+                conn = get_db_connection()
+                conn.execute("DELETE FROM mapping_config WHERE project_id=? AND domain=? AND table_name=?", (proj_id, sel_domain, sel_table))
+                conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
+                conn.commit(); conn.close()
+                st.rerun()
 
         if st.button("Save Config"):
             conn = get_db_connection()
@@ -706,9 +770,6 @@ def main_app():
                         conn.execute("INSERT INTO mapping_config (project_id, domain, table_name, config_json) VALUES (?, ?, ?, ?)", (proj_id, sel_domain, sel_table, json.dumps(config)))
                         conn.commit(); conn.close(); st.rerun()
             else: st.caption("No value mappings.")
-
-            # REMOVED: Close Editor button
-            # if st.button("Close Editor"): del st.session_state['active_mapping_field']; st.rerun()
 
     # --- NEW: DATA DICTIONARY ---
     elif selected_view == "Data Dictionary":
@@ -990,6 +1051,7 @@ def main_app():
                                 df.at[idx, 'Google_Address'] = res['MatchedAddress']
                                 df.at[idx, 'Google_Status'] = res['Status']
                                 df.at[idx, 'Google_Conf'] = res['Confidence']
+                                df.at[idx, 'PlaceID'] = res['PlaceID'] # Save PlaceID for Parsing
                                 if HAS_FUZZY: df.at[idx, 'Fuzzy_Match'] = validate_fuzzy(df.loc[idx], col_mapping)
                             
                             st.session_state['steward_df'] = df
@@ -1014,6 +1076,66 @@ def main_app():
                             st.session_state['steward_df'] = df
                             st.success("VAT Validation Complete!")
                             st.rerun()
+                
+                # --- NEW: PARSE ADDRESS COMPONENTS ---
+                st.markdown("---")
+                if st.button("🧩 Parse Address Components (House No, Street, City, Zip, Country)"):
+                    if 'PlaceID' in st.session_state['steward_df'].columns:
+                        df = st.session_state['steward_df'].copy()
+                        with st.spinner("Parsing Address Components from Google..."):
+                            results_map = {}
+                            # Identify rows with a PlaceID
+                            rows_to_parse = df[df['PlaceID'].notna() & (df['PlaceID'] != '')]
+                            
+                            if rows_to_parse.empty:
+                                st.warning("No Google Place IDs found. Run 'Check Address' first.")
+                            else:
+                                with ThreadPoolExecutor(max_workers=10) as executor:
+                                    futures = {executor.submit(parse_address_components, row): row.name for _, row in rows_to_parse.iterrows()}
+                                    for future in as_completed(futures):
+                                        res = future.result()
+                                        results_map[res['index']] = res
+                                
+                                for idx, res in results_map.items():
+                                    if res.get('found'):
+                                        df.at[idx, 'Extracted_House_Number'] = res['Extracted_House_Number']
+                                        df.at[idx, 'Extracted_Street'] = res['Extracted_Street']
+                                        df.at[idx, 'Extracted_City'] = res['Extracted_City']
+                                        df.at[idx, 'Extracted_Postal_Code'] = res['Extracted_Postal_Code']
+                                        df.at[idx, 'Extracted_Country'] = res['Extracted_Country']
+                                
+                                st.session_state['steward_df'] = df
+                                st.success("Parsing Complete! New columns added.")
+                                st.rerun()
+                    else:
+                        st.error("Please run 'Check Address (Google Maps)' first to generate Place IDs.")
+
+        # --- NEW: REMEDIATION / TRANSFORM TOOLS ---
+        with st.expander("🛠️ Remediation & Transformations"):
+            st.info("Fix data issues by applying transformations.")
+            
+            c_tf1, c_tf2, c_tf3 = st.columns([2, 1, 1])
+            split_col = c_tf1.selectbox("Select Column to Split", st.session_state['steward_df'].columns)
+            max_len = c_tf2.number_input("Max Length", min_value=1, value=20)
+            
+            if c_tf3.button("Split & Expand"):
+                df = st.session_state['steward_df'].copy()
+                # 1. Calculate max chunks needed
+                max_chunks = 1
+                for val in df[split_col].dropna().astype(str):
+                    chunks = (len(val) // max_len) + (1 if len(val) % max_len > 0 else 0)
+                    if chunks > max_chunks: max_chunks = chunks
+                
+                # 2. Create new columns
+                new_cols = [f"{split_col}_{i+1}" for i in range(max_chunks)]
+                
+                # 3. Apply split logic
+                for i, new_c in enumerate(new_cols):
+                    df[new_c] = df[split_col].astype(str).apply(lambda x: x[i*max_len : (i+1)*max_len] if len(x) > i*max_len else "")
+                
+                st.session_state['steward_df'] = df
+                st.success(f"Split '{split_col}' into {max_chunks} columns based on length {max_len}.")
+                st.rerun()
 
         show_errors = c_filter.checkbox("Show Rows with Errors Only")
 
