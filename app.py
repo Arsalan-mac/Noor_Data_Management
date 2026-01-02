@@ -302,7 +302,8 @@ def generate_python_rule(description, columns, provider, api_key):
         "\n3. Handle None/NaN: use `.isna()` or `.notna()`."
         "\n4. If checking strings, use `.str.contains(...)` or `.str.len()`."
         "\n5. Date checks: ensure column is converted if needed or assume ISO format strings."
-        "\n6. **CRITICAL:** Do NOT wrap the entire expression in quotes."
+        "\n6. **CRITICAL:** Do NOT wrap the entire expression in quotes (e.g. do NOT return \"df['A'] > 5\")."
+        "\n7. Ensure all brackets and quotes are balanced."
         "\nExample Output: (df['Age'] > 18) & (df['Status'] == 'Active')"
     )
     prompt = f"DataFrame Columns: {columns}\nRequirement: {description}\n\nBoolean Expression:"
@@ -312,7 +313,17 @@ def generate_python_rule(description, columns, provider, api_key):
         return f"(df['{col}'].notna())"
         
     code = query_llm(provider, api_key, prompt, system_prompt)
-    cleaned = re.sub(r'```python|```', '', code).strip().strip("'").strip('"')
+    
+    # Cleaning Logic
+    cleaned = re.sub(r'```python|```', '', code).strip()
+    
+    # Only remove quotes if they start AND end the string (i.e. it's wrapped)
+    # This prevents removing a starting quote if the end is missing (or vice versa), though rare.
+    if cleaned.startswith("'") and cleaned.endswith("'"):
+        cleaned = cleaned[1:-1]
+    elif cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1]
+        
     return cleaned
 
 # --- AUTH ---
@@ -752,8 +763,9 @@ def main_app():
 
         edited_data = st.data_editor(edit_df, use_container_width=True, hide_index=True, column_config=col_config, num_rows="fixed")
 
-        # 5. Save Button
-        if st.button("Save Dictionary", type="primary"):
+        # 5. Save Button and Download
+        c_save, c_dl = st.columns([1, 1])
+        if c_save.button("Save Dictionary", type="primary"):
             conn = get_db_connection()
             # Delete old entries for this table to avoid duplicates/orphans
             conn.execute("DELETE FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=?", 
@@ -778,6 +790,14 @@ def main_app():
             conn.commit()
             conn.close()
             st.success("Data Dictionary Saved Successfully!")
+            st.rerun() # Rerun to refresh the download button with latest data
+
+        # Download Logic
+        if not edited_data.empty:
+            towrite_dict = io.BytesIO()
+            edited_data.to_excel(towrite_dict, index=False, header=True)
+            towrite_dict.seek(0)
+            c_dl.download_button("Download Dictionary (Excel)", towrite_dict, f"dictionary_{sel_table}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
     # 5. DQ RULES CONFIGURATION
@@ -809,39 +829,60 @@ def main_app():
         col_studio, col_lib = st.columns([1, 1])
 
         with col_studio:
-            st.subheader("Rule Editor")
+            st.subheader("Rule Creator")
             with st.container(border=True):
-                r_name = st.text_input("Rule Name", value=st.session_state.get('edit_name', ''), placeholder="e.g., Check_Active_Status", key="input_rname")
+                r_name = st.text_input("Rule Name (Required)", value=st.session_state.get('edit_name', ''), placeholder="e.g., Check_Active_Status", key="input_rname")
                 r_desc = st.text_area("Requirement (English)", value=st.session_state.get('edit_desc', ''), placeholder="e.g., Status must be 'Active'", key="input_rdesc")
                 
-                if st.button("✨ Generate Logic"):
-                    code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
-                    st.session_state['txt_code_area_widget'] = code
-                    st.session_state['txt_code_area'] = code
-                    st.rerun()
-                
-                code_input = st.text_area("Python Boolean Mask", value=st.session_state.get('txt_code_area', ''), height=120, key="txt_code_area_widget")
-                st.session_state['txt_code_area'] = code_input
-
-                c_test, c_save = st.columns(2)
-                if c_test.button("🧪 Test Rule"):
-                    if not code_input: st.error("No code.")
+                # AUTOMATED BUTTON: Generate, Save, and Rerun
+                if st.button("✨ Generate & Save Rule", type="primary"):
+                    if not r_name or not r_desc:
+                        st.error("Please provide both Rule Name and Requirement.")
                     else:
-                        try:
-                            local_scope = {'df': sample_df.head(50), 'pd': pd, 'np': np}
-                            mask = eval(code_input, {"__builtins__": None}, local_scope)
-                            if isinstance(mask, pd.Series) and mask.dtype == bool:
-                                st.success(f"✅ Valid. Pass: {mask.sum()}, Fail: {len(mask)-mask.sum()}")
-                            else: st.error("Error: Must return Boolean Series.")
-                        except Exception as e: st.error(f"Error: {e}")
+                        with st.spinner("Generating Python Logic & Saving..."):
+                            # 1. Generate Code
+                            code = generate_python_rule(r_desc, cols, st.session_state['active_project']['llm_provider'], st.session_state.get('api_key'))
+                            
+                            # 2. Save directly to DB
+                            conn = get_db_connection()
+                            current_id = st.session_state.get('edit_rule_id')
+                            if current_id:
+                                conn.execute("UPDATE dq_rules SET rule_name=?, rule_description=?, python_code=? WHERE id=?", 
+                                                (r_name, r_desc, code, current_id))
+                                st.toast("Rule Updated & Saved!")
+                            else:
+                                conn.execute("INSERT INTO dq_rules (project_id, domain, table_name, rule_name, rule_description, python_code) VALUES (?, ?, ?, ?, ?, ?)",
+                                                (proj_id, sel_domain, sel_table, r_name, r_desc, code))
+                                st.toast("Rule Created & Saved!")
+                            conn.commit()
+                            conn.close()
 
-                c_save.button("💾 Save Rule", type="primary", on_click=save_rule_callback, args=(proj_id, sel_domain, sel_table))
+                            # 3. Clear State
+                            st.session_state['edit_rule_id'] = None
+                            st.session_state['edit_name'] = ""
+                            st.session_state['edit_desc'] = ""
+                            st.session_state['edit_code'] = ""
+                            st.session_state['txt_code_area'] = ""
+                            st.session_state['txt_code_area_widget'] = ""
+                            st.session_state['input_rname'] = ""
+                            st.session_state['input_rdesc'] = ""
+                            
+                            # 4. Refresh List
+                            time.sleep(1)
+                            st.rerun()
 
         with col_lib:
             st.subheader("Existing Rules")
             conn = get_db_connection()
             rules = pd.read_sql_query("SELECT id, rule_name, rule_description, python_code FROM dq_rules WHERE project_id=? AND domain=? AND table_name=?", conn, params=(proj_id, sel_domain, sel_table))
             conn.close()
+            
+            # Download Rules Button
+            if not rules.empty:
+                towrite_rules = io.BytesIO()
+                rules.to_excel(towrite_rules, index=False, header=True)
+                towrite_rules.seek(0)
+                st.download_button("Download Rules (Excel)", towrite_rules, f"rules_{sel_table}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             
             if not rules.empty:
                 for i, row in rules.iterrows():
@@ -850,7 +891,7 @@ def main_app():
                         st.code(row['python_code'], language='python')
                         c_edit, c_del = st.columns([1, 1])
                         if c_edit.button("Edit", key=f"ed_{row['id']}"):
-                            load_rule_and_delete(row['id'], row['rule_name'], row['rule_description'], row['python_code'])
+                            load_rule_for_edit(row['id'], row['rule_name'], row['rule_description'], row['python_code'])
                             st.rerun()
                         if c_del.button("Delete", key=f"del_{row['id']}"):
                             delete_rule_db(row['id'])
@@ -1063,16 +1104,21 @@ def main_app():
                     'dq_dimension': 'N/A'
                 }
 
-            # 4. Construct Sexy Dark Mode Graph
+            # 4. Construct Sexy Dark Mode Graph (Compact, TB)
             dot_code = f"""
             digraph G {{
-                rankdir=LR;
+                rankdir=TB;
                 bgcolor="transparent";
-                node [fontname="Arial", fontsize=12, shape=box, style="filled,rounded", color="white", fontcolor="white", penwidth=1.5, margin=0.2];
-                edge [fontname="Arial", fontsize=10, color="#94a3b8", penwidth=1.2, arrowsize=0.8];
+                # Tighter packing
+                nodesep=0.3;
+                ranksep=0.4;
+                
+                # Smaller nodes
+                node [fontname="Arial", fontsize=9, shape=box, style="filled,rounded", color="white", fontcolor="white", penwidth=1.0, margin=0.1, height=0.3];
+                edge [fontname="Arial", fontsize=8, color="#94a3b8", penwidth=1.0, arrowsize=0.7];
 
                 # Root
-                root [label="{field_data['field_name']}", fillcolor="#2563eb", height=0.6, fontsize=14];
+                root [label="{field_data['field_name']}", fillcolor="#2563eb", height=0.4, fontsize=11];
 
                 # Clusters (Subgraphs)
                 subgraph cluster_bus {{
@@ -1162,39 +1208,4 @@ def main_app():
 
             with st.chat_message("assistant"):
                 df = st.session_state['chat_df']
-                sys_prompt = f"Data Analyst. Columns: {df.columns.tolist()}. Generate Python code in ```python blocks to answer."
-                api_key = st.session_state.get('api_key')
-                provider = st.session_state['active_project']['llm_provider']
-                
-                resp = query_llm(provider, api_key, user_input, sys_prompt)
-                
-                code_match = re.search(r'```python(.*?)```', resp, re.DOTALL)
-                final_resp = resp
-                
-                if code_match:
-                    code = code_match.group(1).strip()
-                    try:
-                        f = io.StringIO()
-                        with redirect_stdout(f):
-                            local_scope = {'df': df, 'pd': pd, 'np': np}
-                            exec(code, {}, local_scope)
-                        output = f.getvalue()
-                        new_df = local_scope.get('df')
-                        if new_df is not None and not new_df.equals(df):
-                            st.session_state['chat_df'] = new_df
-                            final_resp += "\n\n✅ **Data Modified**"
-                        if output: final_resp += f"\n\n**Output:**\n```\n{output}\n```"
-                    except Exception as e: final_resp += f"\n\n❌ Error: {e}"
-                
-                st.markdown(final_resp)
-                st.session_state["chat_history"].append({"role": "assistant", "content": final_resp})
-
-        if st.button("Save Chat Changes to Disk"):
-            if path.endswith('.csv'): st.session_state['chat_df'].to_csv(path, index=False)
-            else: st.session_state['chat_df'].to_excel(path, index=False)
-            st.success("Changes Saved!")
-
-# --- RUN ---
-init_db()
-if not st.session_state['authenticated']: login_page()
-else: main_app()
+                sys_prompt = f"Data
