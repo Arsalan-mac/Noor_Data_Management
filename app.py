@@ -10,6 +10,7 @@ import re
 import sys
 import requests
 import threading
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
@@ -409,6 +410,10 @@ def delete_rule_db(r_id):
         st.session_state['txt_code_area_widget'] = ""
         st.session_state['input_rname'] = ""
         st.session_state['input_rdesc'] = ""
+
+def wrap_text(text, width=25):
+    """Helper to wrap text for Graphviz labels"""
+    return "\\n".join(textwrap.wrap(str(text), width=width))
 
 # --- MAIN APP ---
 def main_app():
@@ -1026,78 +1031,106 @@ def main_app():
         st.divider()
         st.subheader("🧩 Data Dictionary Visualizer")
         
-        # Fetch dictionary data
-        conn = get_db_connection()
-        dd_df = pd.read_sql_query("SELECT * FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=?", 
-                                  conn, params=(proj_id, sel_domain, sel_table))
-        conn.close()
+        # 1. Get available columns from the current dataframe (ensure realtime sync with file)
+        available_columns = st.session_state['steward_df'].columns.tolist()
         
-        if not dd_df.empty:
-            # Field Selector
-            dd_field = st.selectbox("Select Field to Visualize", dd_df['field_name'].unique())
+        # Field Selector
+        dd_field = st.selectbox("Select Field to Visualize", available_columns)
+        
+        if dd_field:
+            # 2. Fetch dictionary data
+            conn = get_db_connection()
+            dd_df = pd.read_sql_query("SELECT * FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=? AND field_name=?", 
+                                      conn, params=(proj_id, sel_domain, sel_table, dd_field))
+            conn.close()
             
-            # Get data for this field
-            field_data = dd_df[dd_df['field_name'] == dd_field].iloc[0]
-            
-            # Construct Graph
+            # 3. Use fetched data OR defaults if not yet saved in dictionary
+            if not dd_df.empty:
+                field_data = dd_df.iloc[0]
+            else:
+                # Create a default dict with empty values
+                field_data = {
+                    'field_name': dd_field,
+                    'business_definition': 'Not defined',
+                    'data_owner': 'N/A',
+                    'e2e_process': 'N/A',
+                    'data_type': str(st.session_state['steward_df'][dd_field].dtype),
+                    'allowed_length': 'N/A',
+                    'system_name': 'N/A',
+                    'created_sys': 'N/A',
+                    'updated_sys': 'N/A',
+                    'dq_rule': 'N/A',
+                    'dq_dimension': 'N/A'
+                }
+
+            # 4. Construct Sexy Dark Mode Graph
             dot_code = f"""
             digraph G {{
                 rankdir=LR;
-                node [shape=box, style="filled,rounded", fontname="Arial", margin=0.2];
-                edge [fontname="Arial", fontsize=10, color="#64748b"];
+                bgcolor="transparent";
+                node [fontname="Arial", fontsize=12, shape=box, style="filled,rounded", color="white", fontcolor="white", penwidth=1.5, margin=0.2];
+                edge [fontname="Arial", fontsize=10, color="#94a3b8", penwidth=1.2, arrowsize=0.8];
 
                 # Root
-                root [label="{field_data['field_name']}", fillcolor="#2563eb", fontcolor="white", fontsize=14];
+                root [label="{field_data['field_name']}", fillcolor="#2563eb", height=0.6, fontsize=14];
 
-                # Business Node
-                bus [label="Business Info", fillcolor="#e2e8f0"];
-                def [label="Def: {field_data['business_definition'] or 'N/A'}", shape=note];
-                owner [label="Owner: {field_data['data_owner'] or 'N/A'}"];
-                proc [label="Process: {field_data['e2e_process'] or 'N/A'}"];
+                # Clusters (Subgraphs)
+                subgraph cluster_bus {{
+                    label=""; penwidth=0;
+                    bus [label="Business Info", fillcolor="#059669"]; # Emerald
+                    def [label="Definition\\n{wrap_text(field_data['business_definition'] or 'N/A', 30)}", shape=note, fillcolor="#064e3b", fontcolor="#cbd5e1"];
+                    owner [label="Owner: {field_data['data_owner'] or 'N/A'}", fillcolor="#064e3b", fontcolor="#cbd5e1"];
+                    proc [label="Process: {field_data['e2e_process'] or 'N/A'}", fillcolor="#064e3b", fontcolor="#cbd5e1"];
+                }}
 
-                # Technical Node
-                tech [label="Technical", fillcolor="#e2e8f0"];
-                type [label="Type: {field_data['data_type']}"];
-                len [label="Len: {field_data['allowed_length'] or 'N/A'}"];
-                sys [label="System: {field_data['system_name'] or 'N/A'}"];
+                subgraph cluster_tech {{
+                    label=""; penwidth=0;
+                    tech [label="Technical", fillcolor="#d97706"]; # Amber
+                    type [label="Type: {field_data['data_type']}", fillcolor="#78350f", fontcolor="#cbd5e1"];
+                    len [label="Len: {field_data['allowed_length'] or 'N/A'}", fillcolor="#78350f", fontcolor="#cbd5e1"];
+                    sys [label="System: {field_data['system_name'] or 'N/A'}", fillcolor="#78350f", fontcolor="#cbd5e1"];
+                }}
 
-                # Systems Node
-                systems [label="Lineage", fillcolor="#e2e8f0"];
-                c_sys [label="Created: {field_data['created_sys'] or 'N/A'}"];
-                u_sys [label="Updated: {field_data['updated_sys'] or 'N/A'}"];
+                subgraph cluster_lin {{
+                    label=""; penwidth=0;
+                    systems [label="Lineage", fillcolor="#7c3aed"]; # Violet
+                    c_sys [label="Created: {field_data['created_sys'] or 'N/A'}", fillcolor="#5b21b6", fontcolor="#cbd5e1"];
+                    u_sys [label="Updated: {field_data['updated_sys'] or 'N/A'}", fillcolor="#5b21b6", fontcolor="#cbd5e1"];
+                }}
 
-                # DQ Node
-                dq [label="Quality", fillcolor="#e2e8f0"];
-                rule [label="Rule: {field_data['dq_rule'] or 'N/A'}"];
-                dim [label="Dim: {field_data['dq_dimension'] or 'N/A'}"];
+                subgraph cluster_dq {{
+                    label=""; penwidth=0;
+                    dq [label="Quality", fillcolor="#db2777"]; # Pink/Red
+                    rule [label="Rule: {field_data['dq_rule'] or 'N/A'}", fillcolor="#9d174d", fontcolor="#cbd5e1"];
+                    dim [label="Dim: {field_data['dq_dimension'] or 'N/A'}", fillcolor="#9d174d", fontcolor="#cbd5e1"];
+                }}
 
                 # Connections
-                root -> bus;
+                root -> bus [color="#059669"];
                 bus -> def;
                 bus -> owner;
                 bus -> proc;
 
-                root -> tech;
+                root -> tech [color="#d97706"];
                 tech -> type;
                 tech -> len;
                 tech -> sys;
 
-                root -> systems;
+                root -> systems [color="#7c3aed"];
                 systems -> c_sys;
                 systems -> u_sys;
 
-                root -> dq;
+                root -> dq [color="#db2777"];
                 dq -> rule;
                 dq -> dim;
             }}
             """
+            
             try:
-                st.graphviz_chart(dot_code)
+                st.graphviz_chart(dot_code, use_container_width=True)
             except Exception as e:
-                st.error(f"Graphviz visualization failed (Graphviz might not be installed). Showing text instead.")
-                st.json(field_data.to_dict())
-        else:
-            st.info("No Data Dictionary definitions found for this table. Go to 'Data Dictionary' tab to define them.")
+                st.error(f"Graphviz visualization failed. Showing text data.")
+                st.json(field_data if isinstance(field_data, dict) else field_data.to_dict())
 
 
     # 7. SMART A.I.
