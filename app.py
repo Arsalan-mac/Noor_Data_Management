@@ -90,6 +90,29 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS mapping_config (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, config_json TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS dq_results_log (id INTEGER PRIMARY KEY, project_id INTEGER, domain TEXT, table_name TEXT, rule_name TEXT, pass_count INTEGER, fail_count INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, is_latest BOOLEAN DEFAULT 1)''')
     
+    # New Table for Data Dictionary
+    c.execute('''CREATE TABLE IF NOT EXISTS data_dictionary (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER,
+        domain TEXT,
+        table_name TEXT,
+        field_name TEXT,
+        system_name TEXT,
+        business_definition TEXT,
+        category TEXT,
+        allowed_length TEXT,
+        data_type TEXT,
+        dq_dimension TEXT,
+        dq_rule TEXT,
+        accountable_role TEXT,
+        created_sys TEXT,
+        updated_sys TEXT,
+        blocked_sys TEXT,
+        deleted_sys TEXT,
+        data_owner TEXT,
+        e2e_process TEXT
+    )''')
+    
     # Seeds
     c.execute("SELECT * FROM users WHERE email='admin@company.com'")
     if not c.fetchone():
@@ -397,8 +420,9 @@ def main_app():
         if st.session_state['active_project']: st.success(f"📂 Active: {st.session_state['active_project']['name']}")
         else: st.warning("⚠️ No Project Selected")
         
-        menu_items = ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "DQ Rules Config", "Data Cleansing", "Smart A.I."]
-        icons = ['speedometer2', 'gear', 'cloud-upload', 'git', 'tools', 'shield-check', 'compass']
+        # ADDED "Data Dictionary" to menu
+        menu_items = ["Dashboard", "Project Setup", "Data Ingestion", "Data Mapping", "Data Dictionary", "DQ Rules Config", "Data Cleansing", "Smart A.I."]
+        icons = ['speedometer2', 'gear', 'cloud-upload', 'git', 'book', 'tools', 'shield-check', 'compass']
         selected_view = option_menu("Navigation", menu_items, icons=icons, menu_icon="cast", default_index=0, styles={"container": {"padding": "0!important", "background-color": "#0f172a"},"nav-link": {"font-size": "14px", "text-align": "left", "--hover-color": "#1e293b"},"nav-link-selected": {"background-color": "#1e293b", "border-left": "4px solid #2563eb"}}) if HAS_OPTION_MENU else st.radio("Navigation", menu_items)
         if st.button("Logout"): st.session_state['authenticated'] = False; st.rerun()
 
@@ -637,6 +661,119 @@ def main_app():
             else: st.caption("No value mappings.")
 
             if st.button("Close Editor"): del st.session_state['active_mapping_field']; st.rerun()
+
+    # --- NEW: DATA DICTIONARY ---
+    elif selected_view == "Data Dictionary":
+        st.title("📚 Data Dictionary Workbench")
+        if not st.session_state['active_project']: st.error("Select Project"); return
+        proj_id = st.session_state['active_project']['id']
+
+        conn = get_db_connection()
+        t_df = pd.read_sql_query("SELECT domain, table_name, file_path FROM data_log WHERE project_id=?", conn, params=(proj_id,))
+        conn.close()
+        
+        if t_df.empty: st.warning("No Data Ingested"); return
+
+        c_dom, c_tbl = st.columns(2)
+        avail_domains = sorted(t_df['domain'].unique().tolist())
+        sel_domain = c_dom.selectbox("Select Domain", avail_domains)
+        avail_tables = t_df[t_df['domain'] == sel_domain]['table_name'].unique().tolist()
+        sel_table = c_tbl.selectbox("Select Table", avail_tables)
+
+        # 1. Load actual file to get columns
+        path = t_df[(t_df['domain'] == sel_domain) & (t_df['table_name'] == sel_table)]['file_path'].values[0]
+        try: 
+            if path.endswith('.csv'): 
+                src_df = pd.read_csv(path, nrows=1)
+            else: 
+                src_df = pd.read_excel(path, nrows=1)
+            actual_cols = src_df.columns.tolist()
+            actual_dtypes = src_df.dtypes.astype(str).to_dict()
+        except: 
+            st.error("Could not read file structure."); return
+
+        # 2. Load existing dictionary entries
+        conn = get_db_connection()
+        dict_df = pd.read_sql_query("SELECT * FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=?", 
+                                    conn, params=(proj_id, sel_domain, sel_table))
+        conn.close()
+
+        # 3. Merge: Ensure we have a row for every actual column
+        # Create a base dataframe from the actual file columns
+        base_data = []
+        for col in actual_cols:
+            row = {
+                'field_name': col,
+                'data_type': str(actual_dtypes.get(col, 'Unknown')),
+                # Default empty values for other fields
+                'system_name': '', 'business_definition': '', 'category': '',
+                'allowed_length': '', 'dq_dimension': '', 'dq_rule': '',
+                'accountable_role': '', 'created_sys': '', 'updated_sys': '',
+                'blocked_sys': '', 'deleted_sys': '', 'data_owner': '', 'e2e_process': ''
+            }
+            # Update with existing data if found
+            if not dict_df.empty:
+                existing = dict_df[dict_df['field_name'] == col]
+                if not existing.empty:
+                    # Map existing values, excluding id/proj/domain/table
+                    for k in row.keys():
+                        if k in existing.columns and pd.notna(existing.iloc[0][k]):
+                            row[k] = existing.iloc[0][k]
+            base_data.append(row)
+        
+        edit_df = pd.DataFrame(base_data)
+
+        st.info("Edit metadata for fields below. 'Field Name' is from the source file.")
+        
+        # 4. Display Editor
+        # Define column config for better UI
+        col_config = {
+            "field_name": st.column_config.TextColumn("Attribute (Field)", disabled=True),
+            "data_type": st.column_config.TextColumn("Data Type"),
+            "system_name": st.column_config.TextColumn("System Name"),
+            "business_definition": st.column_config.TextColumn("Business Definition", width="large"),
+            "category": st.column_config.SelectboxColumn("Category", options=["Master Data", "Transactional", "Reference", "Metadata"]),
+            "allowed_length": st.column_config.TextColumn("Length"),
+            "dq_dimension": st.column_config.SelectboxColumn("DQ Dimension", options=["Accuracy", "Completeness", "Consistency", "Validity", "Uniqueness", "Timeliness"]),
+            "dq_rule": st.column_config.TextColumn("DQ Rule"),
+            "accountable_role": st.column_config.TextColumn("Accountable Role"),
+            "created_sys": st.column_config.TextColumn("Created In"),
+            "updated_sys": st.column_config.TextColumn("Updated In"),
+            "blocked_sys": st.column_config.TextColumn("Blocked In"),
+            "deleted_sys": st.column_config.TextColumn("Deleted In"),
+            "data_owner": st.column_config.TextColumn("Data Owner"),
+            "e2e_process": st.column_config.TextColumn("E2E Process")
+        }
+
+        edited_data = st.data_editor(edit_df, use_container_width=True, hide_index=True, column_config=col_config, num_rows="fixed")
+
+        # 5. Save Button
+        if st.button("Save Dictionary", type="primary"):
+            conn = get_db_connection()
+            # Delete old entries for this table to avoid duplicates/orphans
+            conn.execute("DELETE FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=?", 
+                         (proj_id, sel_domain, sel_table))
+            
+            # Insert new data
+            for _, row in edited_data.iterrows():
+                conn.execute("""
+                    INSERT INTO data_dictionary (
+                        project_id, domain, table_name, field_name, system_name, 
+                        business_definition, category, allowed_length, data_type, 
+                        dq_dimension, dq_rule, accountable_role, created_sys, 
+                        updated_sys, blocked_sys, deleted_sys, data_owner, e2e_process
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    proj_id, sel_domain, sel_table, row['field_name'], row['system_name'],
+                    row['business_definition'], row['category'], row['allowed_length'], row['data_type'],
+                    row['dq_dimension'], row['dq_rule'], row['accountable_role'], row['created_sys'],
+                    row['updated_sys'], row['blocked_sys'], row['deleted_sys'], row['data_owner'], row['e2e_process']
+                ))
+            
+            conn.commit()
+            conn.close()
+            st.success("Data Dictionary Saved Successfully!")
+
 
     # 5. DQ RULES CONFIGURATION
     elif selected_view == "DQ Rules Config":
@@ -884,6 +1021,84 @@ def main_app():
         st.session_state['steward_df'].to_excel(towrite, index=False, header=True)
         towrite.seek(0)
         c_dl.download_button("Download Excel", towrite, f"clean_{sel_table}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        
+        # --- NEW: DATA DICTIONARY VISUALIZER ---
+        st.divider()
+        st.subheader("🧩 Data Dictionary Visualizer")
+        
+        # Fetch dictionary data
+        conn = get_db_connection()
+        dd_df = pd.read_sql_query("SELECT * FROM data_dictionary WHERE project_id=? AND domain=? AND table_name=?", 
+                                  conn, params=(proj_id, sel_domain, sel_table))
+        conn.close()
+        
+        if not dd_df.empty:
+            # Field Selector
+            dd_field = st.selectbox("Select Field to Visualize", dd_df['field_name'].unique())
+            
+            # Get data for this field
+            field_data = dd_df[dd_df['field_name'] == dd_field].iloc[0]
+            
+            # Construct Graph
+            dot_code = f"""
+            digraph G {{
+                rankdir=LR;
+                node [shape=box, style="filled,rounded", fontname="Arial", margin=0.2];
+                edge [fontname="Arial", fontsize=10, color="#64748b"];
+
+                # Root
+                root [label="{field_data['field_name']}", fillcolor="#2563eb", fontcolor="white", fontsize=14];
+
+                # Business Node
+                bus [label="Business Info", fillcolor="#e2e8f0"];
+                def [label="Def: {field_data['business_definition'] or 'N/A'}", shape=note];
+                owner [label="Owner: {field_data['data_owner'] or 'N/A'}"];
+                proc [label="Process: {field_data['e2e_process'] or 'N/A'}"];
+
+                # Technical Node
+                tech [label="Technical", fillcolor="#e2e8f0"];
+                type [label="Type: {field_data['data_type']}"];
+                len [label="Len: {field_data['allowed_length'] or 'N/A'}"];
+                sys [label="System: {field_data['system_name'] or 'N/A'}"];
+
+                # Systems Node
+                systems [label="Lineage", fillcolor="#e2e8f0"];
+                c_sys [label="Created: {field_data['created_sys'] or 'N/A'}"];
+                u_sys [label="Updated: {field_data['updated_sys'] or 'N/A'}"];
+
+                # DQ Node
+                dq [label="Quality", fillcolor="#e2e8f0"];
+                rule [label="Rule: {field_data['dq_rule'] or 'N/A'}"];
+                dim [label="Dim: {field_data['dq_dimension'] or 'N/A'}"];
+
+                # Connections
+                root -> bus;
+                bus -> def;
+                bus -> owner;
+                bus -> proc;
+
+                root -> tech;
+                tech -> type;
+                tech -> len;
+                tech -> sys;
+
+                root -> systems;
+                systems -> c_sys;
+                systems -> u_sys;
+
+                root -> dq;
+                dq -> rule;
+                dq -> dim;
+            }}
+            """
+            try:
+                st.graphviz_chart(dot_code)
+            except Exception as e:
+                st.error(f"Graphviz visualization failed (Graphviz might not be installed). Showing text instead.")
+                st.json(field_data.to_dict())
+        else:
+            st.info("No Data Dictionary definitions found for this table. Go to 'Data Dictionary' tab to define them.")
+
 
     # 7. SMART A.I.
     elif selected_view == "Smart A.I.":
